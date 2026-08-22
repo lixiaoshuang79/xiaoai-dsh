@@ -71,7 +71,7 @@ class SpeakerManager implements ISpeaker {
       const res = await this.runShell(
         url
           ? `miplayer -f '${url}'`
-          : `/usr/sbin/tts_play.sh '${text || "你好"}'`,
+          : `date +%s > /tmp/xdf_our_pending; /usr/sbin/tts_play.sh '${text || "你好"}'`,
         { timeout }
       );
       return res?.exit_code === 0;
@@ -83,7 +83,7 @@ class SpeakerManager implements ISpeaker {
             url: url,
             type: 1,
           })}'`
-        : `ubus call mibrain text_to_speech '${jsonEncode({
+        : `date +%s > /tmp/xdf_our_pending; ubus call mibrain text_to_speech '${jsonEncode({
             text: text || "你好",
             save: 0,
           })}'`,

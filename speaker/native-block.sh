@@ -1,9 +1,10 @@
 #!/bin/sh
-# 音箱自主大脑：
-# 正常模式（Mac 在线）：设备指令在原生执行前拦截（重启 mico_aivs_lab），
-#   全权交给本地 AI（Mac 上的桥走 HA 执行）；普通问答不拦（本地 AI 处理）。
+# 音箱自主大脑（正常模式=Mac 在线）：
+#   每轮语音 RecognizeResult 落盘后立即杀官方进程（官方永远不发声、不执行、不放歌），
+#   问答/设备/媒体全部由本地 AI（Mac 上的桥）接管；
+#   官方重连后云端补发的响应由执行指令兜底（kill_official_execution）掐执行部件。
 # 直连模式（Mac 挂了，direct-mode.sh 置 /tmp/direct_mode）：
-#   拦截官方回答（重启原生）+ 直连大模型 + 本地 TTS 播报，音箱自主回答。
+#   官方放行设备/媒体，问答拦截官方抢答 + 直连大模型 + 本地 TTS 播报。
 #
 # 大模型配置从 /data/open-xiaoai/config.env 读取（由 xiaoai-dsh localhost
 # 后台生成部署），降级提示词从 /data/open-xiaoai/system_prompt.txt 读取。
@@ -75,30 +76,92 @@ restart_aivs() {
   fi
 }
 
+hook_loaded() {
+  # LD_PRELOAD 钩子是否在官方进程上生效
+  # （v3 钩子 = 官方写 Speak 指令瞬间零竞态杀 mediaplayer —— 官方 TTS 唯一播放者；
+  #   我们的 TTS/音乐走 miplayer，不受影响）
+  local aivs
+  aivs=$(pgrep -f '^/usr/bin/mico_aivs_lab$' | head -1)
+  [ -n "$aivs" ] && grep -q LD_PRELOAD /proc/$aivs/environ 2>/dev/null
+}
+
+kill_tts_chain() {
+  # v3 钩子在官方写 Speak 的瞬间已零竞态杀光 mediaplayer（官方 TTS 唯一播放者，
+  # 我们走 miplayer 不受影响）。这里只做延时补重启：确认没有存活的 mediaplayer
+  # 才重启——若还活着说明是钩子放行的官方合法应答（闹钟/音量确认），绝不能打断。
+  # 注意：/bin/pidof 会匹配僵尸进程（重启残留），必须用 /proc/stat 状态排除 Z。
+  ( sleep 0.6
+    alive=0
+    for p in $(/bin/pidof mediaplayer 2>/dev/null); do
+      [ "$(cut -d' ' -f3 /proc/$p/stat 2>/dev/null)" != "Z" ] && alive=1
+    done
+    if [ "$alive" = "0" ]; then
+      sleep 1.4
+      /etc/init.d/mediaplayer restart >/dev/null 2>&1
+    fi
+  ) &
+}
+
 kill_official_leftovers() {
-  # 官方 TTS/媒体播放链独立于 mico_aivs_lab（mibrain_service/mediaplayer/quickplayer 各有
-  # 自己的服务进程）。官方云端对点歌等媒体指令响应极快，可能在杀进程前就已把 TTS 和
-  # 播放指令下发出去——必须同步掐掉，否则「官方复活」（点歌类媒体指令云端响应极快，
-  # 官方说「打开小米音箱APP」还自己放起了歌单）。
+  # 官方 TTS/媒体播放链独立于 mico_aivs_lab（mediaplayer/quickplayer 各有自己的服务进程）。
+  # 官方云端对点歌等媒体指令响应极快，可能在杀进程前就已把播放指令下发出去——
+  # 必须同步掐掉，否则「官方复活」（孙燕姿事故：官方说「打开小米音箱APP」还自己
+  # 放起了歌单）。官方 TTS 由 v3 钩子在 Speak 落盘瞬间杀 mediaplayer 拦截，
+  # 这里无需预杀（避免误伤正在播放的本地 AI 播报）。
   ubus call mediaplayer player_play_operation '{"action":"stop"}' >/dev/null 2>&1
   mphelper pause >/dev/null 2>&1
   for i in 1 2 3; do kill -9 $(/bin/pidof miplayer) 2>/dev/null; sleep 0.2; done
-  # 掐官方 TTS：重启 mibrain_service（procd 守护自动拉起，本地 AI 的 TTS 紧随其后可正常用）
-  ( /etc/init.d/mibrain_service restart >/dev/null 2>&1 & )
   # 清官方播放器状态（quickplayer 是官方媒体播放进程）
   ( /etc/init.d/quickplayer restart >/dev/null 2>&1 & )
-  # 官方重连后云端可能补发媒体指令（拉歌单较慢、随后才开播），延迟 3s 再清一次
-  # （3s 时本地 AI 尚未开始播放音乐，安全）
-  ( sleep 3; ubus call mediaplayer player_play_operation '{"action":"stop"}' >/dev/null 2>&1 ) &
+}
+
+kill_official_execution() {
+  # 官方补发响应兜底（五月天事故）：官方被重启后重连云，云端会把之前
+  # 没送达的响应（官方音乐搜索很慢，可晚到 30 秒+）补发给重连后的官方，官方照样
+  # 说话放歌。这里在官方执行指令落盘瞬间掐执行部件，且不重启官方进程——重启只会
+  # 诱发再次补发，形成循环。
+  case "$1" in
+    Execute)
+      # 设备执行指令：IR 执行在官方进程内，只能杀官方进程拦（hook 词表已零竞态
+      # 覆盖常见设备词，这里兜底罕见词漏网场景）
+      restart_aivs
+      log "blocked-exec-device: Execute"
+      ;;
+    Speak|StartAnswer)
+      # 官方说话：v3 钩子已在写指令瞬间零竞态杀 mediaplayer（官方 TTS 唯一播放者，
+      # 我们走 miplayer 不受影响），这里补 mediaplayer 死了才延时重启。
+      # 不碰 mibrain/misound/官方进程——重启官方只会诱发云端再次补发形成死循环。
+      # @uptime 用于竞速延迟诊断
+      kill_tts_chain
+      log "blocked-exec-tts: $1 @$(cut -d' ' -f1 /proc/uptime)"
+      ;;
+    *)
+      # 官方媒体指令（Play/歌单等）：官方播放是 REPLACE_ALL 会顶掉本地音乐，必须掐
+      ubus call mediaplayer player_play_operation '{"action":"stop"}' >/dev/null 2>&1
+      mphelper pause >/dev/null 2>&1
+      ( /etc/init.d/quickplayer restart >/dev/null 2>&1 & )
+      log "blocked-exec-media: $1"
+      ;;
+  esac
 }
 
 log "started"
 # tail -n 0：只读新增行，重启时不重放旧日志（避免刚启动就误杀一轮官方）
 tail -n 0 -F /tmp/mico_aivs_lab/instruction.log 2>/dev/null | while read -r line; do
-  case "$line" in
-    *'"name":"RecognizeResult"'*) ;;
-    *) continue ;;
+  name=$(printf '%s\n' "$line" | sed -n 's/.*"name":"\([A-Za-z_]*\)".*/\1/p')
+  [ -z "$name" ] && continue
+
+  # ---- 官方响应执行指令补发兜底（正常/直连模式通用判断，直连放行官方） ----
+  case "$name" in
+    StartAnswer|Speak|Play|LOOP_MODE|SetProperty|InstructionControl|Execute|Group|wangyiyun)
+      if [ ! -f "$MODE_FLAG" ]; then
+        kill_official_execution "$name"
+      fi
+      continue
+      ;;
   esac
+
+  [ "$name" = "RecognizeResult" ] || continue
   case "$line" in
     *'"is_final":true'*) ;;
     *) continue ;;
@@ -137,13 +200,10 @@ tail -n 0 -F /tmp/mico_aivs_lab/instruction.log 2>/dev/null | while read -r line
   # 云端下发的官方 TTS/新闻电台/媒体/执行指令全部进不来——官方永远不发声、不执行。
   # ASR 结果在杀之前已写入 instruction.log，migpt/本地 AI 链路不受影响；
   # 官方重启后自动重连云端，下一轮语音识别照常（用户说话间隔远大于重连时间）。
-  # 官方复活事故补强：官方 TTS 由 mibrain_service、媒体链由 mediaplayer/
-  # quickplayer 独立进程执行，官方响应快时可能已抢先下发——同步掐掉残留。
+  # 孙燕姿事故补强：官方 TTS 由 v3 钩子拦截、媒体链由 quickplayer/mediaplayer
+  # 独立进程执行，官方响应快时可能已抢先下发——同步掐掉残留。
   restart_aivs
   kill_official_leftovers
   log "blocked-all: $text"
   continue
 done
-
-
-

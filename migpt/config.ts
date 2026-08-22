@@ -196,6 +196,7 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
     if (["闭嘴", "别说了", "停下", "别念了", "安静"].includes(text)) {
       await engine.speaker.setPlaying(false);
       flushPlayQueue(); // 清空排队中的播报（深通道推送等一律作废）
+      stopMusic(); // 连正在播/排队中的音乐一起停（musicEpoch+1 作废队列 + 杀 miplayer）
       try {
         await engine.speaker.runShell(
           "/data/open-xiaoai/restart-aivs.sh /data/open-xiaoai/hook_final.so",
@@ -255,6 +256,11 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
     //    流式回答屏障（chunk 连续播，深通道推送等回答外播报不插队）。
     const epoch = newDialog();
     beginAnswer(); // 流式回答开始：回答外播报（推送/唤醒/音乐）挂起
+    // 通知音箱端钩子「我们正在作答」：官方在此期间的 Speak（抢答/补发）会被
+    // 钩子杀 mediaplayer 拦截；闹钟等官方独占应答（native 放行）不写此标记。
+    engine.speaker
+      .runShell("date +%s > /tmp/xdf_our_pending", { timeout: 5000 })
+      .catch(() => {});
     let fullText = "";
     let dialogueAction = ""; // keep_open | end | ""（默认 end）
     let nativePass = false;

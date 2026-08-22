@@ -92,13 +92,22 @@ xiaoai-dsh 把小米 AI 音箱改造成「本地大模型语音管家」：音�
 
 - **核心机制**：`native-block.sh` 监听 `/tmp/mico_aivs_lab/instruction.log` 的
   `RecognizeResult`（`is_final:true`），每轮语音拿到最终文本后**立即**
-  `restart-aivs.sh`（带 LD_PRELOAD hook_final.so 的干净重启）杀掉官方进程。
-  官方云端下发的 TTS/媒体/执行指令全部进不来——**官方永远不发声、不执行**。
+  `restart-aivs.sh`（带 LD_PRELOAD 钩子链 hook_final.so:hook_tts.so 的干净重启）
+  杀掉官方进程。官方云端下发的 TTS/媒体/执行指令全部进不来——**官方永远不发声、
+  不执行**。
 - ASR 结果在杀之前已写入 instruction.log，migpt/本地 AI 链路不受影响；
   官方重启后自动重连云端，下一轮语音识别照常（用户说话间隔远大于重连时间）。
-- `kill_official_leftovers` 同步掐官方残留：停官方 TTS（重启 mibrain_service）、
-  清官方播放器状态（停 mediaplayer / 杀 miplayer / 重启 quickplayer），
-  延迟 3s 再清一次（防官方重连后云端补发媒体指令）。
+- **官方 TTS 零竞态拦截**：hook_tts.so 在官方写 Speak 指令的 write/writev 瞬间
+  杀光所有 mediaplayer（官方 TTS 唯一播放者；本地 AI 的 TTS/音乐走 miplayer，
+  杀 mediaplayer 零影响）。判别三态：官方版权失败话术 LEAK-KILL、本地作答中
+  （`/tmp/xdf_our_pending` 15s 时间窗）PEND-KILL、闹钟/音量官方独占确认 PASS。
+- **官方补发响应兜底**：`kill_official_execution` 在官方执行指令
+  （Speak/StartAnswer/Play/LOOP_MODE/Execute/wangyiyun…）落盘瞬间掐执行部件，
+  **绝不重启官方进程**（重启只会诱发云端再次补发，形成死循环）：
+  Speak/StartAnswer → kill_tts_chain（僵尸进程感知的 mediaplayer 延时补重启）；
+  媒体指令 → 停 mediaplayer + 重启 quickplayer；Execute → restart_aivs 拦 IR。
+- `kill_official_leftovers` 同步掐官方残留（点歌类媒体指令云端响应极快，
+  可能抢先下发）：停 mediaplayer / 杀 miplayer / 重启 quickplayer。
 - **唤醒音「在呢」不受影响**：它在 RecognizeResult 之前由本地链路触发。
 - **ASR 仍依赖官方云端**（语音云 FLAC 上传）：完全断网 = 音箱聋。
   所以方案是「杀进程」而不是「断网」。
@@ -259,7 +268,12 @@ hass-mcp 全量工具 + 桥内置工具（见 §7）。流程：垫场词 → �
   音箱 ubus mibrain ai_service nlp_text），1-2 秒完成，适合单句设备控制；
   首选仍是 HA entity_action。
 - **web_audio_play**：网络音频在线播放（B 站适配器 + 通用浏览器捕获兜底 +
-  防盗链 relay 4378）。点歌降级链：网易云 → web_audio_play → 深。
+  防盗链 relay 4378）。B 站必须用 `fnval=0&quality=32` 渐进式完整 mp4
+  （fnval=16 的 DASH .m4s 裸分片 miplayer/VLC 播不了、永远缓冲），且一律走
+  Mac relay（直链探针 Range 200 会误判、miplayer 实拉挂起）。点歌降级链：
+  网易云 → web_audio_play → 深（netease_music_play 工具内部自动降级 B 站，
+  一次工具调用完成点歌）。工具找到音乐后流式垫「找到了，马上放。」覆盖
+  回答生成期的静音空档。
 - **speaker_music_control**：暂停/继续（桥记 last_music_url 重播）。
 - **网易云 4 工具**：netease_music_play（点歌正版快链）/ netease_music_personal
   （每日推荐/红心/歌单）/ netease_music_playlist（歌单名匹配）/

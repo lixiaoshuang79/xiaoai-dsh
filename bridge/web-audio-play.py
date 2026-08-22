@@ -34,6 +34,8 @@ MAC_IP = cfg_mac("ip") or "127.0.0.1"
 MIGPT_PLAY_URL = "http://127.0.0.1:4398/play_url"
 MIGPT_EXEC_URL = "http://127.0.0.1:4398/exec"
 RELAY_PORT = 4378  # Mac 本机流式转发端口（音箱经 http://<电脑IP>:4378 拉流，IP 从配置读取）
+RELAY_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".relay-state.json")
+# relay 目标状态文件：每次点歌重写，relay 每次请求重读——多首歌不串流
 
 # 平台注册表：key=平台名，value=ego-browser 一侧的解析逻辑（Node 脚本片段）。
 # 每个适配器最终 cliLog 一个 JSON：{title, url, duration?, source}，
@@ -82,7 +84,7 @@ if (!bv) {
     const t = r.title.replace(/<[^>]+>/g, '')
     let s = 0
     for (const k of KW_TOKENS) if (t.includes(k)) s += 1
-    if (/合集|精选|专辑|串烧|歌单|车载|循环|50首|100首|纯音乐|背景音乐/.test(t)) s -= 3
+    if (/合集|精选|专辑|串烧|歌单|车载|循环|50首|100首|纯音乐|背景音乐|演唱会|联唱|跨年|现场|首唱|梦幻联动|科普|了解|盘点|排行|介绍|历史|人物|纪录片|入坑|回顾|解读/.test(t)) s -= 3
     const d = String(r.duration || '').split(':').map(Number)
     const sec = d.length === 2 ? d[0] * 60 + d[1] : (d[0] || 0)
     if (sec > 900) s -= 2
@@ -99,14 +101,11 @@ if (!bv) {
 const v = JSON.parse(await api('https://api.bilibili.com/x/web-interface/view?bvid=' + bv))
 if (v.code !== 0 || !v.data) { cliLog('PLATFORM_ERR bilibili view ' + v.code); process.exit(0) }
 title = title || v.data.title
-const p = JSON.parse(await api('https://api.bilibili.com/x/player/playurl?bvid=' + bv + '&cid=' + v.data.cid + '&fnval=16&fnver=0&fourk=1'))
-if (p.code !== 0 || !p.data || !p.data.dash) { cliLog('PLATFORM_ERR bilibili playurl ' + p.code); process.exit(0) }
-const audios = (p.data.dash.audio || []).sort((a, b) => b.bandwidth - a.bandwidth)
-if (!audios.length) { cliLog('PLATFORM_ERR bilibili no-audio'); process.exit(0) }
-let pick = 0
-if (QUALITY === 'mid') pick = Math.min(1, audios.length - 1)
-if (QUALITY === 'low') pick = audios.length - 1
-cliLog(JSON.stringify({ title: title.slice(0, 60), url: audios[pick].baseUrl, duration: v.data.duration, source: 'bilibili', ref: bv }))
+const p = JSON.parse(await api('https://api.bilibili.com/x/player/playurl?bvid=' + bv + '&cid=' + v.data.cid + '&fnval=0&fnver=0&fourk=1&quality=32'))
+// fnval=0 = 渐进式完整 mp4（VLC/miplayer 可直接播）；fnval=16 的 DASH .m4s 裸分片 miplayer 播不了（永远缓冲）
+if (p.code !== 0 || !p.data || !(p.data.durl || []).length) { cliLog('PLATFORM_ERR bilibili playurl ' + p.code); process.exit(0) }
+const durl = p.data.durl[0]
+cliLog(JSON.stringify({ title: title.slice(0, 60), url: durl.url, duration: v.data.duration, source: 'bilibili', ref: bv }))
 """
 
 GENERIC_ADAPTER = r"""
@@ -165,30 +164,53 @@ ADAPTER_HEADER = "const task = await useOrCreateTaskSpace('web-audio-play')\n"
 
 RELAY_CODE = r'''
 import http.server
+import json
 import shutil
+import ssl
 import sys
 import threading
 import time
 import urllib.request
 
-TARGET = sys.argv[1]
+# 目标 URL/Referer 存状态文件，每次请求重读：多次点歌时永远拉最新一首的流
+STATE = sys.argv[3]
+# 部分平台 CDN（如 B 站 mcdn）证书链不完整，Python 默认校验必失败——只拉音频流，跳过校验
+CTX = ssl._create_unverified_context()
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
-REFERER = sys.argv[2] if len(sys.argv) > 2 else "https://www.bilibili.com/"
 LAST = [time.time()]
 MAX_IDLE = 1800  # 30 分钟无请求自动退出（一首歌最多 20 分钟）
+
+def current():
+    try:
+        with open(STATE) as f:
+            d = json.load(f)
+        return d.get("url"), d.get("referer") or "https://www.bilibili.com/"
+    except Exception:
+        return None, "https://www.bilibili.com/"
 
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def do_GET(self):
         LAST[0] = time.time()
+        if self.path == "/ping":
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         try:
-            req = urllib.request.Request(TARGET, headers={
-                "User-Agent": UA, "Referer": REFERER})
+            target, ref = current()
+            if not target:
+                raise Exception("no target")
+            req = urllib.request.Request(target, headers={
+                "User-Agent": UA, "Referer": ref})
             rng = self.headers.get("Range")
             if rng:
                 req.add_header("Range", rng)
-            with urllib.request.urlopen(req, timeout=60) as up:
+            with urllib.request.urlopen(req, timeout=60, context=CTX) as up:
                 self.send_response(up.status)
                 for k, v in up.headers.items():
                     if k.lower() in ("content-type", "content-length",
@@ -240,13 +262,21 @@ def _relay_alive() -> bool:
         return False
 
 
-def _start_relay(url: str, referer: str) -> None:
+def _start_relay() -> None:
     """起流式转发进程（带 Referer/UA 转发平台 CDN 流，零落盘零转码）。"""
     code = RELAY_CODE.replace("{port}", str(RELAY_PORT))
     subprocess.Popen(
-        [sys.executable, "-c", code, url, referer],
+        [sys.executable, "-c", code, "-", "-", RELAY_STATE],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True)  # 脱离父进程，播放期间持续服务
+
+
+def _ensure_relay(url: str, referer: str) -> None:
+    """更新 relay 目标并确保进程在跑（每次点歌重写目标文件，防多首歌串流）。"""
+    with open(RELAY_STATE, "w") as f:
+        json.dump({"url": url, "referer": referer}, f)
+    if not _relay_alive():
+        _start_relay()
 
 
 def _shell(cmd: str) -> str:
@@ -354,15 +384,15 @@ def main() -> None:
             print(f"[web-audio] {res.get('source')}: {res['title']}"
                   + (f" ({res['duration']}s)" if res.get("duration") else ""))
             play_url = res["url"]
-            # 直链探测：CDN 裸拉可行 → 音箱直接拉（零代理）；防盗链平台 → Mac 流式转发
-            if _url_reachable(play_url):
-                print("[web-audio] 直链可行，音箱直接拉流")
-            else:
-                print("[web-audio] 平台有防盗链，Mac 流式转发（零落盘）")
+            # B 站 CDN 直链探针会误判（Range 探针 200 但 miplayer 实际拉流挂起，实测卡死），
+            # 一律走 Mac 流式转发（带 Referer 拉流，已验证稳定）；其他平台才探测直链。
+            if res.get("source") == "bilibili" or not _url_reachable(play_url):
+                print("[web-audio] 平台有防盗链/直链不稳，Mac 流式转发（零落盘）")
                 ref = "https://www.bilibili.com/" if res.get("source") == "bilibili" else "https://www.douyin.com/"
-                if not _relay_alive():
-                    _start_relay(play_url, ref)
+                _ensure_relay(play_url, ref)
                 play_url = f"http://{MAC_IP}:{RELAY_PORT}/stream"
+            else:
+                print("[web-audio] 直链可行，音箱直接拉流")
             if no_play:
                 # 只拿 URL 不播放：把播放时机交回调用方（桥在 AI 回答播报完后再放）
                 print(f"[web-audio] URL: {play_url}")

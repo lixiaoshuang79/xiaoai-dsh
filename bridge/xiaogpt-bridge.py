@@ -400,7 +400,7 @@ INTENT_TAXONOMY = {
         "scene": {"route": "flash_tools", "desc": "场景联动（离家模式/回家模式等）"},
     },
     "media": {
-        "play_music": {"route": "flash_tools", "desc": "点歌/放歌/来点音乐/播放某首歌/听XX的歌——网易云优先，搜不到用 web_audio_play"},
+        "play_music": {"route": "flash_tools", "desc": "点歌/放歌/来点音乐/播放某首歌/听XX的歌——网易云优先，搜不到用 web_audio_play；对播放的抱怨（没加载出来/一直卡着/放不出来/怎么没声音）也归此类，重跑工具重试"},
         "personal_playlist": {"route": "flash_tools", "desc": "每日推荐/我喜欢的歌/我的歌单——网易云账号专属"},
         "play_story": {"route": "flash", "desc": "讲故事/儿歌/相声——AI 直接讲"},
         "play_radio": {"route": "flash_tools", "desc": "电台/广播——本地 web_audio_play 搜索电台流"},
@@ -881,7 +881,8 @@ def _netease_run(args: list, timeout: int = 40) -> str:
         proc = subprocess.run(
             [NETEASE_MUSIC] + args,
             capture_output=True, text=True, timeout=timeout,
-            env={**os.environ, "PATH": os.path.dirname(NETEASE_MUSIC) + ":" + os.environ.get("PATH", "")},
+            env={**os.environ,
+                 "PATH": os.path.dirname(NETEASE_MUSIC) + ":" + os.path.dirname(NODE) + ":" + os.environ.get("PATH", "")},
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError("网易云接口超时")
@@ -947,21 +948,23 @@ def _netease_pick_song(songs: list, query: str) -> dict | None:
 
 
 def netease_music_play(query: str) -> str:
-    """搜索网易云歌曲并播放第一首可播版本：search → url → 登记待播放。"""
+    """搜索网易云歌曲并播放第一首可播版本：search → url → 登记待播放。
+    网易云无版权/搜不到时自动降级 web_audio_play（B 站/浏览器）找音源——
+    一次工具调用完成点歌，省掉模型第二轮往返（点歌更快）。"""
     try:
         songs = _netease_search_songs(query)
-        if not songs:
-            return "[网易云搜不到] 没有找到相关歌曲"
-        song = _netease_pick_song(songs, query)
-        if not song:
-            return "[网易云无版权] 这首歌网易云没有可播放的版权版本，请用其他方式找找"
-        url = _netease_get_url(song["id"])
-        _queue_play(url, f"{song.get('name', '')} - {song.get('artists', '')}")
-        name = song.get("name", "")
-        artists = str(song.get("artists") or "").replace("/", "、")
-        return f"已找到：{name}" + (f" - {artists}" if artists else "")
+        if songs:
+            song = _netease_pick_song(songs, query)
+            if song:
+                url = _netease_get_url(song["id"])
+                _queue_play(url, f"{song.get('name', '')} - {song.get('artists', '')}")
+                name = song.get("name", "")
+                artists = str(song.get("artists") or "").replace("/", "、")
+                return f"已找到：{name}" + (f" - {artists}" if artists else "")
     except (RuntimeError, json.JSONDecodeError, KeyError, OSError) as e:
-        return f"[网易云失败] {str(e)[:120]}"
+        print(f"[bridge] 网易云失败({str(e)[:80]})，降级B站: {query[:30]}", flush=True)
+    # 无版权/搜不到/接口失败 → 自动降级 B 站搜索
+    return web_audio_play(query)
 
 
 def _netease_get_playlists() -> list:
@@ -2538,6 +2541,7 @@ def answer_stream(question: str):
     prompt = build_fast_prompt(question, pending_ctx)
     messages = [{"role": "user", "content": prompt}]
     yield next_filler()  # 垫场：意图分类后立即出声（native/深路由上面已返回，不会到这里）
+    progress_pushed = False  # 工具找到音乐后只垫一句进度语
     for round_idx in range(MAX_TOOL_TURNS):
         full_text = ""          # 本轮完整文本
         tool_calls = []
@@ -2610,6 +2614,11 @@ def answer_stream(question: str):
                 "tool_call_id": tc.get("id", ""),
                 "content": result_text[:4000],
             })
+        # 音乐已找到：立即垫一句进度语，覆盖下一轮模型生成回答的静音空档
+        # （点歌体验：垫场 → 找到了马上放 → 回答 → 音乐，全程有反馈）
+        if _pending_play and not progress_pushed:
+            progress_pushed = True
+            yield "找到了，马上放。"
     yield "抱歉，我查得有点绕，请换个说法再问一次。"
 
 
