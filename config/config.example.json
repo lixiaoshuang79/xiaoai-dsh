@@ -17,12 +17,12 @@
     "device_id": ""
   },
   "speaker": {
-    "ip": "192.168.1.9",
+    "ip": "192.168.1.100",
     "did": "",
     "tts_vendor": "XiaoMi_M88"
   },
   "mac": {
-    "ip": "192.168.1.13"
+    "ip": "192.168.1.200"
   },
   "devices": {
     "main_light": "switch.your_main_light_entity",

@@ -26,12 +26,14 @@ import sys
 import time
 import urllib.request
 
-from config_loader import cfg_paths
+from config_loader import cfg_paths, cfg_mac
 
 EGO_BROWSER = cfg_paths("ego_browser") or "ego-browser"
+# 本机局域网 IP（音箱拉流转发用），从配置读取；取不到时用 127.0.0.1（本机直连场景）
+MAC_IP = cfg_mac("ip") or "127.0.0.1"
 MIGPT_PLAY_URL = "http://127.0.0.1:4398/play_url"
 MIGPT_EXEC_URL = "http://127.0.0.1:4398/exec"
-RELAY_PORT = 4378  # Mac 本机流式转发端口（音箱经 http://192.168.1.13:4378 拉流）
+RELAY_PORT = 4378  # Mac 本机流式转发端口（音箱经 http://<电脑IP>:4378 拉流，IP 从配置读取）
 
 # 平台注册表：key=平台名，value=ego-browser 一侧的解析逻辑（Node 脚本片段）。
 # 每个适配器最终 cliLog 一个 JSON：{title, url, duration?, source}，
@@ -360,7 +362,7 @@ def main() -> None:
                 ref = "https://www.bilibili.com/" if res.get("source") == "bilibili" else "https://www.douyin.com/"
                 if not _relay_alive():
                     _start_relay(play_url, ref)
-                play_url = f"http://192.168.1.13:{RELAY_PORT}/stream"
+                play_url = f"http://{MAC_IP}:{RELAY_PORT}/stream"
             if no_play:
                 # 只拿 URL 不播放：把播放时机交回调用方（桥在 AI 回答播报完后再放）
                 print(f"[web-audio] URL: {play_url}")

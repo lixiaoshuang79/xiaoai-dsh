@@ -16,7 +16,7 @@ if [ -f "$CONF" ]; then
   . "$CONF" 2>/dev/null
   [ -n "$MAC_IP" ] && MAC="$MAC_IP"
 fi
-[ -z "$MAC" ] && MAC="192.168.1.13"
+[ -z "$MAC" ] && MAC="192.168.1.100"
 MODE_FLAG="/tmp/direct_mode"
 FAIL=0
 OK=0
