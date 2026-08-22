@@ -1,0 +1,13 @@
+# xiaoai-dsh 桥（Mac 侧）Python 依赖
+# 建议用独立 venv：
+#   cd bridge && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# 桥主体只依赖标准库；以下为辅助脚本所需：
+aiohttp>=3.9          # refresh-token.py（小米令牌静默刷新）
+cryptography>=42      # miot_lan_probe2.py（MIoTLan 直连调试）
+playwright>=1.44      # extract-cookie.py（提取小米登录 Cookie）
+
+# hass-mcp（HA 工具 MCP 服务器，深通道工具层）：
+#   .venv/bin/pip install hass-mcp
+# xiaogpt（上游 ASR 桥）用独立 venv：
+#   python3 -m venv .venv-xiaogpt && .venv-xiaogpt/bin/pip install xiaogpt

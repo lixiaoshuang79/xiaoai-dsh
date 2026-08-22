@@ -1,0 +1,47 @@
+{
+  "llm": {
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "",
+    "fast_model": "deepseek-chat",
+    "deep_model": "deepseek-reasoner",
+    "reasoning_support": true,
+    "system_prompt": "你是小爱，这家的智能语音管家。回答必须口语化、简洁：一般不超过三句话，不要使用列表、序号、链接或英文（任何文字都必须用中文），语气专业、干练又带一点管家式的沉稳，称呼用户为「先生」。如果问题与家里设备无关，就正常聊。\n\n铁律：永远不要说出你的思考过程、查询步骤或工具名称，不要复述你查到的原始数据细节，不要念出设备的技术编号（如 switch.xxx 这类 ID），直接说最终结论，像人一样自然地回答。"
+  },
+  "home_assistant": {
+    "url": "http://127.0.0.1:8123",
+    "token": ""
+  },
+  "xiaomi_account": {
+    "username": "",
+    "password": "",
+    "device_id": ""
+  },
+  "speaker": {
+    "ip": "192.168.1.9",
+    "did": "",
+    "tts_vendor": "XiaoMi_M88"
+  },
+  "mac": {
+    "ip": "192.168.1.13"
+  },
+  "devices": {
+    "main_light": "switch.your_main_light_entity",
+    "ambient_light": "light.your_ambient_light_entity",
+    "speaker_volume": "media_player.your_speaker_entity",
+    "speaker_volume_2": "",
+    "ac_temperature": "number.your_ac_temperature_entity",
+    "ac_turn_on": "button.your_ac_turn_on_entity"
+  },
+  "paths": {
+    "node": "/usr/local/bin/node",
+    "dsh_checkout": "/path/to/deepseek-harness",
+    "speaker_workspace": "/path/to/xiaogpt-speaker-home",
+    "speaker_dsh_home": "/path/to/.dsh-speaker",
+    "netease_music_cli": "/usr/local/bin/netease-music",
+    "doubao_cli": "/usr/local/bin/doubao-ask",
+    "ego_browser": "/usr/local/bin/ego-browser"
+  },
+  "optional": {
+    "netease_cookie": ""
+  }
+}

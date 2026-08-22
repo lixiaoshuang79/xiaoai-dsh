@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xiaoai-dsh 配置后台</title>
+<style>
+  :root { --bg:#f4f6f8; --card:#fff; --line:#e2e6ea; --text:#1f2937; --muted:#6b7280; --accent:#0f766e; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; padding: 24px 16px 80px; }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+  .card h2 .tag { font-size: 11px; font-weight: normal; color: var(--muted); border: 1px solid var(--line); border-radius: 4px; padding: 0 6px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 16px; }
+  .row .full { grid-column: 1 / -1; }
+  label { display: block; font-size: 12.5px; color: var(--muted); margin-bottom: 4px; }
+  input, textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font: inherit; background: #fff; }
+  textarea { resize: vertical; min-height: 110px; }
+  input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 0; }
+  .bar { display: flex; gap: 10px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+  button { padding: 9px 18px; border: 0; border-radius: 6px; font: inherit; cursor: pointer; background: var(--accent); color: #fff; }
+  button.secondary { background: #fff; color: var(--text); border: 1px solid var(--line); }
+  button:hover { filter: brightness(1.08); }
+  .msg { font-size: 13px; margin-top: 10px; white-space: pre-wrap; }
+  .msg.ok { color: var(--accent); }
+  .msg.err { color: #b91c1c; }
+  .msg.warn { color: #b45309; }
+  code { background: #f1f3f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .files li { font-size: 12.5px; margin: 3px 0; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>xiaoai-dsh 配置后台</h1>
+  <div class="sub">所有配置只保存在本机 <code>config/local.json</code>，不会上传任何地方。保存后自动生成各组件的配置文件。</div>
+
+  <div class="card">
+    <h2>大模型 <span class="tag">OpenAI 兼容 API</span></h2>
+    <div class="row">
+      <div class="full"><label>API 地址（Base URL）</label><input id="llm.base_url" placeholder="https://api.deepseek.com/v1"></div>
+      <div class="full"><label>API Key</label><input id="llm.api_key" type="password" placeholder="sk-..."></div>
+      <div><label>快速模型（日常回答，快）</label><input id="llm.fast_model" placeholder="deepseek-chat"></div>
+      <div><label>深度模型（复杂任务，强）</label><input id="llm.deep_model" placeholder="deepseek-reasoner"></div>
+      <div class="full">
+        <label>系统提示词（System Prompt，人设与铁律）</label>
+        <textarea id="llm.system_prompt"></textarea>
+        <div class="hint">快通道、深通道、音箱端降级模式共用这份提示词；降级模式会自动附加能力受限说明。</div>
+      </div>
+      <div class="full"><label><input type="checkbox" id="llm.reasoning_support" style="width:auto"> 模型支持 reasoning 思考参数（DeepSeek 系开启；部分模型不支持会报错）</label></div>
+    </div>
+    <div class="bar">
+      <button onclick="verify('llm')">测试大模型连接</button>
+      <span id="msg-llm" class="msg"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Home Assistant <span class="tag">设备控制</span></h2>
+    <div class="row">
+      <div><label>HA 地址</label><input id="ha.url" placeholder="http://127.0.0.1:8123"></div>
+      <div><label>长期访问令牌（Token）</label><input id="ha.token" type="password" placeholder="eyJ..."></div>
+    </div>
+    <div class="bar">
+      <button onclick="verify('ha')">测试 HA 连接</button>
+      <span id="msg-ha" class="msg"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>小米账号 <span class="tag">xiaogpt ASR 桥使用</span></h2>
+    <div class="row">
+      <div><label>小米账号（手机号/邮箱）</label><input id="mi.username"></div>
+      <div><label>密码</label><input id="mi.password" type="password"></div>
+      <div class="full"><label>设备 ID（MI_DEVICE_ID，可留空由系统自动发现）</label><input id="mi.device_id"></div>
+    </div>
+    <div class="hint">账号密码只写入本机 <code>bridge/xiaogpt-credentials</code>（权限 600），绝不进入仓库。</div>
+  </div>
+
+  <div class="card">
+    <h2>音箱与电脑 <span class="tag">网络</span></h2>
+    <div class="row">
+      <div><label>音箱 IP</label><input id="speaker.ip" placeholder="192.168.1.9"></div>
+      <div><label>音箱 miot DID（可在米家 App 设备信息里查）</label><input id="speaker.did"></div>
+      <div><label>电脑（本机）局域网 IP</label><input id="mac.ip" placeholder="192.168.1.13"></div>
+      <div><label>TTS 音色（默认男声）</label><input id="speaker.tts_vendor" placeholder="XiaoMi_M88"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>关键设备实体 <span class="tag">HA entity_id</span></h2>
+    <div class="row">
+      <div><label>主灯（说“开灯”默认操作它）</label><input id="devices.main_light" placeholder="switch.xxx"></div>
+      <div><label>氛围灯（说“氛围灯”才操作它）</label><input id="devices.ambient_light" placeholder="light.xxx"></div>
+      <div><label>音箱音量实体</label><input id="devices.speaker_volume" placeholder="media_player.xxx"></div>
+      <div><label>第二台音箱音量实体（可选）</label><input id="devices.speaker_volume_2" placeholder="media_player.xxx"></div>
+      <div><label>空调温度实体（红外空调）</label><input id="devices.ac_temperature" placeholder="number.xxx"></div>
+      <div><label>空调开机按钮实体</label><input id="devices.ac_turn_on" placeholder="button.xxx"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>本地路径 <span class="tag">DSH 深通道</span></h2>
+    <div class="row">
+      <div><label>node 可执行文件</label><input id="paths.node" placeholder="/usr/local/bin/node"></div>
+      <div><label>DeepSeek Harness 检出目录（DSH）</label><input id="paths.dsh_checkout" placeholder="/path/to/deepseek-harness"></div>
+      <div><label>音箱工作目录（历史/记忆存放处）</label><input id="paths.speaker_workspace" placeholder="/path/to/xiaogpt-speaker-home"></div>
+      <div><label>音箱独立 DSH_HOME（隔离会话配置目录）</label><input id="paths.speaker_dsh_home" placeholder="/path/to/.dsh-speaker"></div>
+      <div><label>netease-music CLI 路径（可选）</label><input id="paths.netease_music_cli"></div>
+      <div><label>doubao-ask CLI 路径（可选）</label><input id="paths.doubao_cli"></div>
+      <div><label>ego-browser 路径（可选）</label><input id="paths.ego_browser"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>保存</h2>
+    <div class="bar">
+      <button onclick="save()">保存配置并生成全部文件</button>
+      <button class="secondary" onclick="load()">重新读取</button>
+    </div>
+    <div id="msg-save" class="msg"></div>
+    <ul id="files" class="files"></ul>
+  </div>
+</div>
+
+<script>
+const API = "/api";
+function id(path) { return path.split(".").join("."); }
+function val(path) { return document.getElementById(path).value; }
+function set(path, v) {
+  const el = document.getElementById(path);
+  if (el.type === "checkbox") el.checked = !!v; else el.value = v ?? "";
+}
+
+function collect() {
+  return {
+    llm: {
+      base_url: val("llm.base_url"), api_key: val("llm.api_key"),
+      fast_model: val("llm.fast_model"), deep_model: val("llm.deep_model"),
+      reasoning_support: document.getElementById("llm.reasoning_support").checked,
+      system_prompt: val("llm.system_prompt"),
+    },
+    home_assistant: { url: val("ha.url"), token: val("ha.token") },
+    xiaomi_account: { username: val("mi.username"), password: val("mi.password"), device_id: val("mi.device_id") },
+    speaker: { ip: val("speaker.ip"), did: val("speaker.did"), tts_vendor: val("speaker.tts_vendor") },
+    mac: { ip: val("mac.ip") },
+    devices: {
+      main_light: val("devices.main_light"), ambient_light: val("devices.ambient_light"),
+      speaker_volume: val("devices.speaker_volume"), speaker_volume_2: val("devices.speaker_volume_2"),
+      ac_temperature: val("devices.ac_temperature"), ac_turn_on: val("devices.ac_turn_on"),
+    },
+    paths: {
+      node: val("paths.node"), dsh_checkout: val("paths.dsh_checkout"),
+      speaker_workspace: val("paths.speaker_workspace"), speaker_dsh_home: val("paths.speaker_dsh_home"),
+      netease_music_cli: val("paths.netease_music_cli"),
+      doubao_cli: val("paths.doubao_cli"), ego_browser: val("paths.ego_browser"),
+    },
+    optional: {},
+  };
+}
+
+async function load() {
+  const r = await fetch(API + "/config");
+  const cfg = await r.json();
+  const flat = flatten(cfg);
+  for (const k of Object.keys(flat)) { const el = document.getElementById(k); if (el) set(k, flat[k]); }
+  const m = document.getElementById("msg-save");
+  m.className = "msg " + (cfg._is_example ? "warn" : "ok");
+  m.textContent = cfg._is_example
+    ? "当前读取的是示例配置（还没有 config/local.json），填写后点保存。"
+    : "已读取本机配置。";
+  listFiles();
+}
+
+function flatten(o, p = "") {
+  const out = {};
+  for (const k of Object.keys(o)) {
+    if (k.startsWith("_")) continue;
+    const key = p ? p + "." + k : k;
+    if (o[k] && typeof o[k] === "object" && !Array.isArray(o[k])) Object.assign(out, flatten(o[k], key));
+    else out[key] = o[k];
+  }
+  return out;
+}
+
+async function save() {
+  const m = document.getElementById("msg-save");
+  m.className = "msg"; m.textContent = "保存中…";
+  const r = await fetch(API + "/config", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(collect()),
+  });
+  const j = await r.json();
+  if (r.ok) {
+    m.className = "msg ok";
+    m.textContent = "已保存 config/local.json（权限 600），并生成 " + j.generated.length + " 个派生文件：";
+    listFiles();
+  } else {
+    m.className = "msg err"; m.textContent = "保存失败：" + j.error;
+  }
+}
+
+async function listFiles() {
+  const r = await fetch(API + "/generated");
+  const j = await r.json();
+  const ul = document.getElementById("files");
+  ul.innerHTML = "";
+  for (const f of j.files) {
+    const li = document.createElement("li");
+    li.textContent = "config/generated/" + f;
+    ul.appendChild(li);
+  }
+}
+
+async function verify(kind) {
+  const el = document.getElementById("msg-" + kind);
+  el.className = "msg"; el.textContent = "测试中…";
+  const r = await fetch(API + "/verify", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ type: kind, config: collect() }),
+  });
+  const j = await r.json();
+  el.className = "msg " + (j.ok ? "ok" : "err");
+  el.textContent = j.ok ? "✓ " + (j.detail || "连接成功") : "✗ " + (j.error || "失败");
+}
+
+load();
+</script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+# ===== 本地配置与密钥（由 localhost 后台 admin/server.py 生成，绝不提交）=====
+config/local.json
+config/generated/
+bridge/.env
+bridge/xiaogpt-credentials
+bridge/xiaogpt-config.yml
+speaker/config.env
+speaker/system_prompt.txt
+
+# ===== 运行时产物 =====
+logs/
+*.log
+__pycache__/
+*.pyc
+.venv/
+.venv-*/
+node_modules/
+target/
+migpt/open-xiaoai.node
+.DS_Store
+
+# ===== 用户私有数据 =====
+speaker-history.jsonl
+speaker-topics.json
+memories/
+storages/
+sessions/
+attachments/
+
+# ===== 大体积/设备相关产物 =====
+*.squashfs
+*.tar.xz
+client-bin
