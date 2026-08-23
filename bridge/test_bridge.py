@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""xiaogpt-bridge 安全/正确性回归测试（纯离线：monkeypatch 配置与网络）。
+"""xiaogpt-bridge 主桥编排层回归测试（纯离线：monkeypatch 配置与网络）。
 
 运行：python3 -m unittest discover -s bridge -p 'test_*.py' -v
-覆盖：#3 演化工具 shell 移除、#5 桥鉴权、#6 深任务代际、#7 话题 id、
-      #8 pending 统一、#10 设备发现分组、#11 配置 fail-fast、SSRF URL 校验、
-      原子写、文件工具路径安全（symlink/越界/隐藏文件）、HTTP body 限制、
-      提醒先推后删、日志脱敏。
+本文件覆盖主桥编排层：#3 演化工具 shell 移除、#5 桥鉴权、#6 深任务代际、
+#7 topic_choose LLM 编排、#11 配置 fail-fast、文件工具路径安全
+（symlink/越界/隐藏文件）、HTTP body 限制、提醒先推后删。
+纯逻辑叶子模块的测试见 test_security.py / test_state_store.py /
+test_topic_state.py / test_device_discovery.py。
 """
 import datetime
 import io
@@ -30,7 +31,8 @@ b = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(b)  # noqa: E402
 
 import config_loader  # noqa: E402
-
+import security  # noqa: E402
+import topic_state  # noqa: E402
 
 class FakeConfig:
     """给桥模块注入假 SPEAKER_HOME / secret 等（不依赖真实 local.json）。"""
@@ -47,168 +49,24 @@ class FakeConfig:
             b,
             SPEAKER_HOME=self.speaker_home,
             RUNTIME_DIR=self.runtime,
-            HISTORY_FILE=os.path.join(self.runtime, "speaker-history.jsonl"),
-            TOPICS_FILE=os.path.join(self.runtime, "speaker-topics.json"),
-            PENDING_FILE=os.path.join(self.runtime, "speaker-pending.json"),
             REMINDER_FILE=os.path.join(self.runtime, "speaker-reminders.json"),
             EVOLVED_TOOLS_FILE=os.path.join(self.runtime, "evolved-tools.json"),
             RUNTIME_SKILLS_DIR=os.path.join(self.runtime, "speaker-skills"),
             BRIDGE_SECRET="test-secret",
-            ALLOW_PRIVATE_URLS=True,
         )
         patcher.start()
+        # 话题/待答复/历史存储重配到临时目录（原 HISTORY_FILE/TOPICS_FILE 等
+        # 常量已从主桥迁入 topic_state，由 configure() 注入）
+        topic_state.configure(
+            history_file=os.path.join(self.runtime, "speaker-history.jsonl"),
+            topics_file=os.path.join(self.runtime, "speaker-topics.json"),
+            pending_file=os.path.join(self.runtime, "speaker-pending.json"),
+            session_root=os.path.join(self.runtime, "sessions"),
+        )
+        security.ALLOW_PRIVATE_URLS = True
         if self.testcase is not None:
             self.testcase.addCleanup(patcher.stop)
-
-
-class TestValidateAudioUrl(unittest.TestCase):
-    """SSRF 播放 URL 校验（#2 辅助 / 全链路收口）。"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        FakeConfig(self.tmp, self).patch()
-
-    def _dns(self, ips=("93.184.216.34",)):
-        return mock.patch.object(b, "_url_host_ip", return_value=set(ips))
-
-    def test_public_url_ok(self):
-        with self._dns():
-            for u in ("https://example.com/a.mp3",
-                      "http://mirrors.example.cn/x.y?token=abc",
-                      "https://upos-hz-mirrorakam.bilivideo.com/upgcx/a.m4s"):
-                self.assertEqual(b.validate_audio_url(u), u)
-
-    def test_public_ip_literal_ok(self):
-        with self._dns():
-            self.assertEqual(b.validate_audio_url("http://93.184.216.34/a.mp3"),
-                             "http://93.184.216.34/a.mp3")
-
-    def test_private_lan_allowed_by_default(self):
-        with self._dns():
-            # relay URL 是私网地址，默认放行（链路依赖）
-            self.assertEqual(b.validate_audio_url("http://192.168.1.13:4378/s/abc"),
-                             "http://192.168.1.13:4378/s/abc")
-            self.assertEqual(b.validate_audio_url("http://10.0.0.5:8000/a.mp3"),
-                             "http://10.0.0.5:8000/a.mp3")
-
-    def test_loopback_linklocal_metadata_rejected(self):
-        with self._dns():
-            for u in ("http://127.0.0.1:8123/api/states",
-                      "http://localhost/x",
-                      "http://0.0.0.0/x",
-                      "http://169.254.169.254/latest/meta-data/",
-                      "http://[::1]/x"):
-                self.assertIsNone(b.validate_audio_url(u), u)
-
-    def test_bad_scheme_userinfo_length(self):
-        with self._dns():
-            self.assertIsNone(b.validate_audio_url("ftp://example.com/a"))
-            self.assertIsNone(b.validate_audio_url("file:///etc/passwd"))
-            self.assertIsNone(b.validate_audio_url("http://user:pass@example.com/a"))
-            self.assertIsNone(b.validate_audio_url("http://a b.com/x"))
-            self.assertIsNone(b.validate_audio_url("http://" + "a" * 3000 + ".com/x"))
-
-    def test_unresolvable_domain_rejected(self):
-        with mock.patch.object(b, "_url_host_ip", return_value=set()):
-            self.assertIsNone(b.validate_audio_url("http://nonexistent.invalid/a.mp3"))
-
-    def test_strict_mode_rejects_private(self):
-        with mock.patch.object(b, "ALLOW_PRIVATE_URLS", False), self._dns():
-            self.assertIsNone(b.validate_audio_url("http://192.168.1.13:4378/s/abc"))
-            self.assertEqual(b.validate_audio_url("https://example.com/a"), "https://example.com/a")
-
-
-class TestAtomicWriteAndTurn(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        FakeConfig(self.tmp, self).patch()
-
-    def test_atomic_write_leaves_no_tmp(self):
-        p = os.path.join(self.tmp, "x.json")
-        b.atomic_write_json(p, {"a": [1, 2]})
-        self.assertTrue(os.path.isfile(p))
-        self.assertEqual(json.load(open(p, encoding="utf-8")), {"a": [1, 2]})
-        leftovers = [f for f in os.listdir(self.tmp) if ".tmp-" in f]
-        self.assertEqual(leftovers, [])
-
-    def test_turn_monotonic(self):
-        t1 = b.next_turn()
-        t2 = b.next_turn()
-        self.assertLess(t1, t2)
-        self.assertEqual(b.current_turn(), t2)
-
-
-class TestTopicIdStable(unittest.TestCase):
-    """#7：topic 用稳定 id，不随排序变化。"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        FakeConfig(self.tmp, self).patch()
-
-    def test_update_by_id_after_reorder(self):
-        topics = [
-            {"id": "t-a", "summary": "A", "history": [], "last_active": "2026-08-01T00:00:00", "turns": 0},
-            {"id": "t-b", "summary": "B", "history": [], "last_active": "2026-08-01T00:00:00", "turns": 0},
-        ]
-        # 排序后 t-b 在前，但用 id 更新 t-a 不应写错
-        topics.sort(key=lambda t: t.get("last_active", ""), reverse=True)
-        out = b.update_topic(topics, "t-a", "Q1", "A1")
-        ta = next(t for t in out if t["id"] == "t-a")
-        tb = next(t for t in out if t["id"] == "t-b")
-        self.assertEqual(ta["turns"], 1)
-        self.assertEqual(tb["turns"], 0)
-
-    def test_topic_choose_returns_id(self):
-        topics = [{"id": "t-x", "summary": "装修方案", "history": [], "last_active": "x", "turns": 1}]
-        with mock.patch.object(b, "call_llm",
-                               return_value={"content": "1"}) as m:
-            self.assertEqual(b.topic_choose("橱柜什么颜色好", topics), "t-x")
-        with mock.patch.object(b, "call_llm", return_value={"content": "0"}):
-            self.assertEqual(b.topic_choose("今天天气", topics), "")
-
-
-class TestPendingUnified(unittest.TestCase):
-    """#8：pending 只认 keep_open/end 状态，不再用 is_question。"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        FakeConfig(self.tmp, self).patch()
-
-    def _rd(self):
-        try:
-            with open(b.PENDING_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except OSError:
-            return None
-
-    def test_keep_open_writes(self):
-        b.record_pending("q", "A还是B？", "keep_open")
-        d = self._rd()
-        self.assertIsNotNone(d)
-        self.assertEqual(d["question"], "q")
-
-    def test_end_clears(self):
-        b.record_pending("q", "A还是B？", "keep_open")
-        b.record_pending("q2", "好的", "end")
-        self.assertIsNone(self._rd())
-
-    def test_consume_pending_returns_context_and_clears(self):
-        b.record_pending("q", "A还是B？", "keep_open")
-        ctx = b.consume_pending("A")
-        self.assertIn("接上一轮反问", ctx)
-        self.assertIn("A", ctx)
-        self.assertIsNone(self._rd())
-
-    def test_expired_pending_cleared(self):
-        b.record_pending("q", "A还是B？", "keep_open")
-        with open(b.PENDING_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        data["ts"] = (datetime.datetime.now() - datetime.timedelta(seconds=b.PENDING_TTL_SECONDS + 1)).isoformat()
-        with open(b.PENDING_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        self.assertEqual(b.consume_pending("x"), "")
-        self.assertIsNone(self._rd())
-
+            self.testcase.addCleanup(lambda: setattr(security, "ALLOW_PRIVATE_URLS", True))
 
 class TestEvolvedToolSecurity(unittest.TestCase):
     """#3：演化工具只许 GET /api/ 只读，shell 一律拒绝；落盘运行时目录。"""
@@ -253,64 +111,6 @@ class TestEvolvedToolSecurity(unittest.TestCase):
         req = u.call_args[0][0]
         self.assertEqual(req.get_method(), "GET")
         self.assertTrue(req.full_url.startswith("http://hass:8123/api/"))
-
-
-class TestDeviceDiscoveryGrouping(unittest.TestCase):
-    """#10：按 device_id 分组，防跨设备串台。"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        FakeConfig(self.tmp, self).patch()
-        b._discovered.clear()
-        for attr in ("AC_TEMP_ENTITY", "AC_MODE_ENTITY", "AC_TURN_ON_ENTITY",
-                     "AC_TURN_OFF_ENTITY", "FAN_ENTITY", "VACUUM_ENTITY"):
-            setattr(b, attr, "")
-
-    def test_two_aircons_not_mixed(self):
-        """两台空调时按组各取各的，绝不一台取温度另一台取模式。"""
-        states = [
-            {"entity_id": "number.ac1_ir_temperature_p", "state": "26",
-             "attributes": {"friendly_name": "空调1温度"}},
-            {"entity_id": "select.ac1_ir_mode_p", "state": "cool"},
-            {"entity_id": "button.ac1_turn_on", "state": "unavailable"},
-            {"entity_id": "number.ac2_ir_temperature_p", "state": "24",
-             "attributes": {"friendly_name": "空调2温度"}},
-            {"entity_id": "select.ac2_ir_mode_p", "state": "heat"},
-            {"entity_id": "button.ac2_turn_on", "state": "unavailable"},
-        ]
-        reg = {s["entity_id"]: "dev-" + s["entity_id"].split(".")[1].split("_")[0]
-               for s in states}
-        with mock.patch.object(b, "_ha_states_all", return_value=states), \
-             mock.patch.object(b, "_ha_entity_registry", return_value=reg):
-            b._discover_devices(force=True)
-        # 多空调不自动绑（宁缺毋滥）
-        self.assertEqual(b.AC_TEMP_ENTITY, "")
-        self.assertEqual(b.AC_MODE_ENTITY, "")
-        # 但两个候选都记录在诊断里（不误绑的前提是发现日志存在）
-        self.assertNotIn("AC_TEMP_ENTITY", b._discovered)
-
-    def test_single_aircon_group_binds(self):
-        states = [
-            {"entity_id": "number.ir_1_ir_temperature_p_2_2", "state": "26"},
-            {"entity_id": "select.ir_1_ir_mode_p_2_1", "state": "cool"},
-            {"entity_id": "button.ir_1_turn_on_a_2_6", "state": "unavailable"},
-            {"entity_id": "button.ir_1_turn_off_a_2_5", "state": "unavailable"},
-            {"entity_id": "switch.other_light", "state": "on"},
-        ]
-        reg = {"number.ir_1_ir_temperature_p_2_2": "dev-ir",
-               "select.ir_1_ir_mode_p_2_1": "dev-ir",
-               "button.ir_1_turn_on_a_2_6": "dev-ir",
-               "button.ir_1_turn_off_a_2_5": "dev-ir",
-               "switch.other_light": "dev-other"}
-        with mock.patch.object(b, "_ha_states_all", return_value=states), \
-             mock.patch.object(b, "_ha_entity_registry", return_value=reg):
-            b._discover_devices(force=True)
-        self.assertEqual(b.AC_TEMP_ENTITY, "number.ir_1_ir_temperature_p_2_2")
-        self.assertEqual(b.AC_MODE_ENTITY, "select.ir_1_ir_mode_p_2_1")
-        self.assertEqual(b.AC_TURN_ON_ENTITY, "button.ir_1_turn_on_a_2_6")
-        self.assertEqual(b.AC_TURN_OFF_ENTITY, "button.ir_1_turn_off_a_2_5")
-        self.assertEqual(b.AC_FAN_UP_ENTITY, "")  # 无该实体不绑
-
 
 class TestFileToolsSafety(unittest.TestCase):
     """文件工具：路径越界/symlink/隐藏文件。"""
@@ -366,7 +166,6 @@ class TestFileToolsSafety(unittest.TestCase):
         out = b.read_computer_file(link)
         self.assertTrue(out.startswith("[拒绝访问"))
 
-
 class TestReminderAtomicPush(unittest.TestCase):
     """提醒：先推后删（推送失败保留）。"""
 
@@ -396,7 +195,6 @@ class TestReminderAtomicPush(unittest.TestCase):
     def test_reminder_set_rejects_past(self):
         out = b.reminder_set((datetime.datetime.now() - datetime.timedelta(hours=1)).isoformat(), "x")
         self.assertTrue(out.startswith("[时间已过]"))
-
 
 class TestHttpHandlerAuthAndLimits(unittest.TestCase):
     """8322：鉴权、Content-Length 校验（直接测 _check_auth/_read_body，
@@ -461,7 +259,6 @@ class TestHttpHandlerAuthAndLimits(unittest.TestCase):
         h = self._h(headers={"Content-Length": str(len(body))}, body=body)
         self.assertEqual(h._read_body(), body)
 
-
 class TestConfigLoaderFailFast(unittest.TestCase):
     """#11：local.json 损坏必须抛错，绝不静默回退 example。"""
 
@@ -490,6 +287,24 @@ class TestConfigLoaderFailFast(unittest.TestCase):
                 self.assertTrue(cfg.get("ok"))
                 config_loader._config_cache = None
 
+class TestTopicChoose(unittest.TestCase):
+    """#7：topic_choose（主桥 LLM 编排）返回稳定 id，不随排序变化。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        FakeConfig(self.tmp, self).patch()
+
+    def test_topic_choose_returns_id(self):
+        topics = [{"id": "t-x", "summary": "装修方案", "history": [], "last_active": "x", "turns": 1}]
+        with mock.patch.object(b, "call_llm",
+                               return_value={"content": "1"}) as m:
+            self.assertEqual(b.topic_choose("橱柜什么颜色好", topics), "t-x")
+        with mock.patch.object(b, "call_llm", return_value={"content": "0"}):
+            self.assertEqual(b.topic_choose("今天天气", topics), "")
+
+    def test_topic_choose_empty_topics(self):
+        self.assertEqual(b.topic_choose("问题", []), "")
+
 
 class TestDeepPushTurn(unittest.TestCase):
     """#6：深任务代际——旧任务不推送不写 pending 不更新话题。"""
@@ -497,8 +312,6 @@ class TestDeepPushTurn(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         FakeConfig(self.tmp, self).patch()
-        b._topics_lock = threading.Lock()
-        b._history_lock = threading.Lock()
 
     def test_push_to_migpt_stale_dropped(self):
         t = b.next_turn()
@@ -514,13 +327,3 @@ class TestDeepPushTurn(unittest.TestCase):
              mock.patch("urllib.request.urlopen") as u:
             b.push_to_migpt("结果", turn=t)
         u.assert_called_once()
-
-
-class TestSafeUrlLog(unittest.TestCase):
-    def test_redacts_query(self):
-        self.assertEqual(b._safe_url("https://x.com/a?token=secret"),
-                         "https://x.com/a")
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)

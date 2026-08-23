@@ -73,6 +73,47 @@ xiaoai-dsh 把小米 AI 音箱改造成「本地大模型语音管家」：音�
   → 音箱 TTS 播报
 ```
 
+
+## 1.1 仓库结构（顶层目录与依赖方向）
+
+```
+speaker/         音箱端脚本（busybox ash）：native-block.sh 拦截/兜底、
+                 direct-mode.sh 直连模式、restart-aivs.sh 干净重启等
+                  │  WS（4399，open-xiaoai client）
+                  ▼
+migpt/           TS 编排引擎 + Rust 底层 client（open-xiaoai.node）
+                 ├─ src/*.ts     对话编排、speaker-gate 播报互斥、config
+                 ├─ src/*.rs     WS client / auth / exec RPC（neon 编译为 node 模块）
+                 └─ test/        单测（TS + Rust）
+                  │  OpenAI 兼容（127.0.0.1:8322/v1，Bearer bridge.secret）
+                  ▼
+bridge/          Python 桥（8322）——「路由大脑」编排层
+                 ├─ xiaogpt-bridge.py   编排主文件（意图/路由/通道/HTTP Handler）
+                 ├─ security.py         URL/IP 校验与日志脱敏（叶子）
+                 ├─ state_store.py      原子写 / turn 代际 / 全局锁（叶子）
+                 ├─ topic_state.py      话题档案/待答复/历史持久化（叶子）
+                 ├─ device_discovery.py HA 设备自动发现（叶子）
+                 ├─ config_loader.py    配置读取（叶子，所有模块共用）
+                 └─ test_*.py           各模块回归测试（纯离线）
+                  │  MCP（8321） / HA REST（8123）
+                  ▼
+        Home Assistant ──▶ 米家设备（MIoTLan 本地直连）
+                  │  深通道（dsh --profile headless，DSH_HOME 隔离）
+                  ▼
+        DSH 深通道（Mac 上的本地大模型大脑）
+
+admin/           本地配置后台（8390，X-Admin-Token）——配置面，不在运行时主链路
+packages/        migpt 依赖的本地包（@mi-gpt 等 pnpm workspace）
+config/          配置模板与生成物（local.json 不入库；runtime 数据不在仓库）
+scripts/         verify.sh / secret-scan.sh 等开发与 CI 脚本
+docs/            架构/配置/部署/FAQ 文档
+```
+
+依赖方向铁律：主桥 xiaogpt-bridge.py → 叶子模块（security / state_store /
+topic_state / device_discovery / config_loader），**叶子模块绝不反向 import
+主桥**。叶子模块只依赖标准库与 config_loader；LLM 编排（topic_choose /
+topic_summarize）留在主桥，topic_state 通过参数注入摘要函数。
+
 ## 2. 端口地图
 
 | 端口 | 进程 | 监听 | 用途 |

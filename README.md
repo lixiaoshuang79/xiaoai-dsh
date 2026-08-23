@@ -34,13 +34,13 @@
 | 目录 | 是什么 |
 |------|--------|
 | `admin/` | 本地配置后台（浏览器里填配置，保存后自动生成各组件要用的配置文件），只监听 127.0.0.1:8390 |
-| `bridge/` | Mac 上的主程序 `xiaogpt-bridge.py`：大模型调用、意图路由、设备指令、音乐、提醒、各类工具，对外是 OpenAI 兼容接口（127.0.0.1:8322） |
+| `bridge/` | Mac 上的主程序 `xiaogpt-bridge.py`（编排层：大模型调用、意图路由、设备指令、音乐、提醒、HTTP Handler）+ 叶子模块：`security.py`（URL/IP 校验与日志脱敏）、`state_store.py`（原子写/turn 代际）、`topic_state.py`（话题档案/待答复/历史持久化）、`device_discovery.py`（HA 设备自动发现）；对外是 OpenAI 兼容接口（127.0.0.1:8322） |
 | `migpt/` | 音箱接入引擎（基于 open-xiaoai 的 MiGPT-Next）：WebSocket 接音箱（4399）、推送播报（4398）、健康检查（4397） |
 | `speaker/` | 部署到音箱 `/data/open-xiaoai/` 的脚本：开机初始化、拦截官方执行、Mac 失联时的直连兜底、预编译的 LD_PRELOAD 拦截库 |
 | `probe/` | 刷机脚本封装和 USB 诊断程序 |
 | `skills/speaker-skills/` | 给深模型复用的技能（按任务匹配注入） |
 | `config/` | 配置模板 `config.example.json`；你本机的真实配置 `local.json` 不进仓库 |
-| `test/` | 各组件回归测试：`bridge/test_bridge.py`、`admin/test_admin.py`、`migpt/test/`、Rust 单元测试（`cargo test`） |
+| `test/` | 各组件回归测试：`bridge/test_bridge.py`（编排层）、`bridge/test_security.py`、`bridge/test_state_store.py`、`bridge/test_topic_state.py`、`bridge/test_device_discovery.py`（叶子模块）、`admin/test_admin.py`、`migpt/test/`、Rust 单元测试（`cargo test`） |
 
 ## 开发环境
 

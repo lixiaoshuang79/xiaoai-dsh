@@ -30,11 +30,13 @@ EXCLUDES=(
 )
 
 # IP 检查额外豁免：仅豁免**必须验证私网/公网 IP 语义**的测试文件
-# （isBlockedHostname/validate_audio_url 等测试用例的样本 IP，非真实网络信息）。
-# 仅豁免「疑似真实 IP」检查；密钥模式检查（run_grep 默认路径）仍覆盖这些文件。
+# （SSRF 校验 / isBlockedHostname / validate_audio_url 等测试用例的样本 IP，
+# 非真实网络信息）。仅豁免「疑似真实 IP」检查；密钥模式检查（run_grep
+# 默认路径）仍覆盖这些文件。
 # 新增含示例 IP 的测试文件时须在此登记（附理由），否则 CI 会红。
 # 注意：仅能换 RFC5737 的样本（如纯解析/示例值）一律先换，不要进此名单。
 EXCLUDES_IP=(
+  ':(exclude)bridge/test_security.py'           # SSRF URL 校验测试：私网/公网/loopback 样本语义必需
   ':(exclude)bridge/test_bridge.py'              # validate_audio_url 私网/公网语义测试
   ':(exclude)migpt/test/speaker-gate.test.ts'    # isBlockedHostname 私网/公网语义测试
 )
