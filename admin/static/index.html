@@ -53,7 +53,7 @@
       <div class="full"><label><input type="checkbox" id="llm.reasoning_support" style="width:auto"> 模型支持 reasoning 思考参数（DeepSeek 系开启；部分模型不支持会报错）</label></div>
     </div>
     <div class="bar">
-      <button onclick="verify('llm')">测试大模型连接</button>
+      <button id="btn-verify-llm">测试大模型连接</button>
       <span id="msg-llm" class="msg"></span>
     </div>
   </div>
@@ -65,7 +65,7 @@
       <div><label>长期访问令牌（Token）</label><input id="ha.token" type="password" placeholder="eyJ..."></div>
     </div>
     <div class="bar">
-      <button onclick="verify('ha')">测试 HA 连接</button>
+      <button id="btn-verify-ha">测试 HA 连接</button>
       <span id="msg-ha" class="msg"></span>
     </div>
   </div>
@@ -83,9 +83,9 @@
   <div class="card">
     <h2>音箱与电脑 <span class="tag">网络</span></h2>
     <div class="row">
-      <div><label>音箱 IP</label><input id="speaker.ip" placeholder="192.168.1.100"></div>
+      <div><label>音箱 IP</label><input id="speaker.ip" placeholder="192.0.2.100"></div>
       <div><label>音箱 miot DID（可在米家 App 设备信息里查）</label><input id="speaker.did"></div>
-      <div><label>电脑（本机）局域网 IP</label><input id="mac.ip" placeholder="192.168.1.200"></div>
+      <div><label>电脑（本机）局域网 IP</label><input id="mac.ip" placeholder="198.51.100.200"></div>
       <div><label>TTS 音色（默认男声）</label><input id="speaker.tts_vendor" placeholder="XiaoMi_M88"></div>
     </div>
   </div>
@@ -130,22 +130,27 @@
   <div class="card">
     <h2>保存</h2>
     <div class="bar">
-      <button onclick="save()">保存配置并生成全部文件</button>
-      <button class="secondary" onclick="load()">重新读取</button>
+      <button id="btn-save">保存配置并生成全部文件</button>
+      <button id="btn-load" class="secondary">重新读取</button>
     </div>
     <div id="msg-save" class="msg"></div>
     <ul id="files" class="files"></ul>
   </div>
 </div>
 
-<script>
+<script nonce="__DSH_ADMIN_NONCE__">
 const API = "/api";
+const ADMIN_TOKEN = window.__ADMIN_TOKEN__ || "";
+function headers(extra) { return Object.assign({ "X-Admin-Token": ADMIN_TOKEN }, extra); }
 function id(path) { return path.split(".").join("."); }
 function val(path) { return document.getElementById(path).value; }
 function set(path, v) {
   const el = document.getElementById(path);
   if (el.type === "checkbox") el.checked = !!v; else el.value = v ?? "";
 }
+
+// 表单不含的段（optional 等）从已读取配置继承，保存时不误抹
+let existingOptional = {};
 
 function collect() {
   return {
@@ -176,13 +181,16 @@ function collect() {
       netease_music_cli: val("paths.netease_music_cli"),
       doubao_cli: val("paths.doubao_cli"), ego_browser: val("paths.ego_browser"),
     },
-    optional: {},
+    optional: Object.assign({}, existingOptional),
   };
 }
 
 async function load() {
-  const r = await fetch(API + "/config");
+  const r = await fetch(API + "/config", { headers: headers() });
   const cfg = await r.json();
+  if (cfg.optional && typeof cfg.optional === "object" && !Array.isArray(cfg.optional)) {
+    existingOptional = cfg.optional;
+  }
   const flat = flatten(cfg);
   for (const k of Object.keys(flat)) { const el = document.getElementById(k); if (el) set(k, flat[k]); }
   const m = document.getElementById("msg-save");
@@ -208,7 +216,7 @@ async function save() {
   const m = document.getElementById("msg-save");
   m.className = "msg"; m.textContent = "保存中…";
   const r = await fetch(API + "/config", {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST", headers: headers({ "Content-Type": "application/json" }),
     body: JSON.stringify(collect()),
   });
   const j = await r.json();
@@ -222,7 +230,7 @@ async function save() {
 }
 
 async function listFiles() {
-  const r = await fetch(API + "/generated");
+  const r = await fetch(API + "/generated", { headers: headers() });
   const j = await r.json();
   const ul = document.getElementById("files");
   ul.innerHTML = "";
@@ -237,13 +245,19 @@ async function verify(kind) {
   const el = document.getElementById("msg-" + kind);
   el.className = "msg"; el.textContent = "测试中…";
   const r = await fetch(API + "/verify", {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST", headers: headers({ "Content-Type": "application/json" }),
     body: JSON.stringify({ type: kind, config: collect() }),
   });
   const j = await r.json();
   el.className = "msg " + (j.ok ? "ok" : "err");
   el.textContent = j.ok ? "✓ " + (j.detail || "连接成功") : "✗ " + (j.error || "失败");
 }
+
+// CSP 禁止内联 onclick，按钮统一走 addEventListener
+document.getElementById("btn-verify-llm").addEventListener("click", function () { verify("llm"); });
+document.getElementById("btn-verify-ha").addEventListener("click", function () { verify("ha"); });
+document.getElementById("btn-save").addEventListener("click", save);
+document.getElementById("btn-load").addEventListener("click", load);
 
 load();
 </script>
