@@ -92,13 +92,25 @@
 
   <div class="card">
     <h2>关键设备实体 <span class="tag">HA entity_id</span></h2>
+    <p class="hint">这些都可以留空——桥启动时会自动扫描 Home Assistant，按米家设备的命名规律匹配（空调、塔扇、扫地机、摄像头等），发现结果打印在桥日志里。只有你家设备名字改得比较特别、自动匹配不对时才需要手填。</p>
     <div class="row">
-      <div><label>主灯（说“开灯”默认操作它）</label><input id="devices.main_light" placeholder="switch.xxx"></div>
-      <div><label>氛围灯（说“氛围灯”才操作它）</label><input id="devices.ambient_light" placeholder="light.xxx"></div>
-      <div><label>音箱音量实体</label><input id="devices.speaker_volume" placeholder="media_player.xxx"></div>
+      <div><label>主灯（说“开灯”默认操作它）</label><input id="devices.main_light" placeholder="switch.xxx（留空自动发现）"></div>
+      <div><label>氛围灯（说“氛围灯”才操作它）</label><input id="devices.ambient_light" placeholder="light.xxx（留空自动发现）"></div>
+      <div><label>音箱音量实体</label><input id="devices.speaker_volume" placeholder="media_player.xxx（留空自动发现）"></div>
       <div><label>第二台音箱音量实体（可选）</label><input id="devices.speaker_volume_2" placeholder="media_player.xxx"></div>
-      <div><label>空调温度实体（红外空调）</label><input id="devices.ac_temperature" placeholder="number.xxx"></div>
-      <div><label>空调开机按钮实体</label><input id="devices.ac_turn_on" placeholder="button.xxx"></div>
+      <div><label>空调温度实体（红外空调）</label><input id="devices.ac_temperature" placeholder="number.xxx（留空自动发现）"></div>
+      <div><label>空调开机按钮实体</label><input id="devices.ac_turn_on" placeholder="button.xxx（留空自动发现）"></div>
+      <div><label>空调关机按钮实体</label><input id="devices.ac_turn_off" placeholder="button.xxx（留空自动发现）"></div>
+      <div><label>空调模式实体（制冷/制热等）</label><input id="devices.ac_mode" placeholder="select.xxx（留空自动发现）"></div>
+      <div><label>空调风速+按钮实体</label><input id="devices.ac_fan_up" placeholder="button.xxx（留空自动发现）"></div>
+      <div><label>空调风速-按钮实体</label><input id="devices.ac_fan_down" placeholder="button.xxx（留空自动发现）"></div>
+      <div><label>风扇实体（塔扇等）</label><input id="devices.fan_entity" placeholder="fan.xxx（留空自动发现）"></div>
+      <div><label>风扇延时关机实体</label><input id="devices.fan_delay_entity" placeholder="number.xxx（留空自动发现）"></div>
+      <div><label>风扇扫风夹角实体</label><input id="devices.fan_angle_entity" placeholder="select.xxx（留空自动发现）"></div>
+      <div><label>摄像头1电源开关</label><input id="devices.camera1_on" placeholder="switch.xxx（留空自动发现）"></div>
+      <div><label>摄像头2电源开关（可选）</label><input id="devices.camera2_on" placeholder="switch.xxx（留空自动发现）"></div>
+      <div><label>扫地机器人实体</label><input id="devices.vacuum_entity" placeholder="vacuum.xxx（留空自动发现）"></div>
+      <div><label>扫地机器人清扫模式实体</label><input id="devices.vacuum_mode_entity" placeholder="select.xxx（留空自动发现）"></div>
     </div>
   </div>
 
@@ -151,6 +163,12 @@ function collect() {
       main_light: val("devices.main_light"), ambient_light: val("devices.ambient_light"),
       speaker_volume: val("devices.speaker_volume"), speaker_volume_2: val("devices.speaker_volume_2"),
       ac_temperature: val("devices.ac_temperature"), ac_turn_on: val("devices.ac_turn_on"),
+      ac_turn_off: val("devices.ac_turn_off"), ac_mode: val("devices.ac_mode"),
+      ac_fan_up: val("devices.ac_fan_up"), ac_fan_down: val("devices.ac_fan_down"),
+      fan_entity: val("devices.fan_entity"), fan_delay_entity: val("devices.fan_delay_entity"),
+      fan_angle_entity: val("devices.fan_angle_entity"),
+      camera1_on: val("devices.camera1_on"), camera2_on: val("devices.camera2_on"),
+      vacuum_entity: val("devices.vacuum_entity"), vacuum_mode_entity: val("devices.vacuum_mode_entity"),
     },
     paths: {
       node: val("paths.node"), dsh_checkout: val("paths.dsh_checkout"),

@@ -91,11 +91,98 @@ CAM2_ON_ENTITY = cfg_devices("camera2_on") or ""
 def _ha_state(entity_id: str) -> dict:
     token = _load_env("HA_TOKEN")
     req = urllib.request.Request(
-        f"http://127.0.0.1:8123/api/states/{entity_id}",
+        f"{_load_env('HA_URL')}/api/states/{entity_id}",
         headers={"Authorization": f"Bearer {token}"},
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+# ---------- 设备自动发现：config 留空时从 HA 扫描自动匹配 ----------
+# 设计：config/devices 是「显式指定」，留空的实体按米家/小米集成的命名规律
+# 自动从 HA 实体里挑，别的家庭拿到项目不用手填实体 ID；已配置的绝不覆盖。
+
+_discovered: dict = {}
+_discovery_done = False
+
+
+def _ha_states_all() -> list:
+    """拉取 HA 全部实体状态（自动发现用；失败返回空列表，不致命）。"""
+    try:
+        req = urllib.request.Request(
+            f"{_load_env('HA_URL')}/api/states",
+            headers={"Authorization": f"Bearer {_load_env('HA_TOKEN')}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return []
+
+
+def _discover_devices(force: bool = False) -> dict:
+    """把 config 留空的设备实体自动填上（幂等，启动时调用一次即可）。
+    返回本次发现结果 {常量名: entity_id}。"""
+    global _discovery_done
+    if _discovery_done and not force:
+        return _discovered
+    _discovery_done = True
+    states = _ha_states_all()
+    if not states:
+        return _discovered
+
+    def fname(s) -> str:
+        return (s.get("attributes") or {}).get("friendly_name") or ""
+
+    def find(pred) -> str:
+        cands = [s for s in states if pred(s)]
+        alive = [s for s in cands if s.get("state") not in ("unavailable", "unknown")]
+        if alive:
+            cands = alive
+        return cands[0]["entity_id"] if cands else ""
+
+    def fill(attr: str, value: str) -> None:
+        if not globals().get(attr) and value:
+            globals()[attr] = value
+            _discovered[attr] = value
+
+    # 塔扇：fan 域、优先带预设风模式（直吹/自然/睡眠风）的
+    fill("FAN_ENTITY",
+         find(lambda s: s["entity_id"].startswith("fan.") and bool((s.get("attributes") or {}).get("preset_modes")))
+         or find(lambda s: s["entity_id"].startswith("fan.")))
+    fill("FAN_DELAY_ENTITY", find(lambda s: s["entity_id"].startswith("number.") and "off_delay_time" in s["entity_id"]))
+    fill("FAN_ANGLE_ENTITY", find(lambda s: s["entity_id"].startswith("select.") and "swing" in s["entity_id"]))
+    # 红外空调（米家红外遥控命名）：温度 number / 模式 select / 开关与风速 button
+    fill("AC_TEMP_ENTITY", find(lambda s: s["entity_id"].startswith("number.") and "ir_temperature" in s["entity_id"]))
+    fill("AC_MODE_ENTITY", find(lambda s: s["entity_id"].startswith("select.") and "ir_mode" in s["entity_id"]))
+    fill("AC_TURN_ON_ENTITY", find(lambda s: s["entity_id"].startswith("button.") and "turn_on" in s["entity_id"]))
+    fill("AC_TURN_OFF_ENTITY", find(lambda s: s["entity_id"].startswith("button.") and "turn_off" in s["entity_id"]))
+    fill("AC_FAN_UP_ENTITY", find(lambda s: "fan_speed_up" in s["entity_id"]))
+    fill("AC_FAN_DOWN_ENTITY", find(lambda s: "fan_speed_down" in s["entity_id"]))
+    # 摄像头：名字带「摄像」的开关实体（on_p_2_1），按 ID 排序取前两台
+    cams = sorted(s["entity_id"] for s in states
+                  if s["entity_id"].startswith("switch.")
+                  and ("摄像" in fname(s) or "摄像" in s["entity_id"])
+                  and ("开关" in fname(s) or "on_p_2_1" in s["entity_id"]))
+    if len(cams) >= 1:
+        fill("CAM1_ON_ENTITY", cams[0])
+    if len(cams) >= 2:
+        fill("CAM2_ON_ENTITY", cams[1])
+    # 扫地机器人：vacuum 域 + cleaning_mode 模式 select
+    fill("VACUUM_ENTITY", find(lambda s: s["entity_id"].startswith("vacuum.")))
+    fill("VACUUM_MODE_ENTITY", find(lambda s: s["entity_id"].startswith("select.") and "cleaning_mode" in s["entity_id"]))
+    # 灯：只认名字明显的（吸顶灯/大灯/主灯、氛围灯），找不到就留空走通用规则
+    fill("MAIN_LIGHT_ENTITY",
+         find(lambda s: ("吸顶灯" in fname(s) or "大灯" in fname(s) or "主灯" in fname(s))
+              and "氛围" not in fname(s)))
+    fill("AMBIENT_LIGHT_ENTITY", find(lambda s: "氛围灯" in fname(s)))
+    # 音箱音量：media_player 名字带「音箱/小爱」的第一台
+    fill("SPEAKER_PLAYER",
+         find(lambda s: s["entity_id"].startswith("media_player.")
+              and ("音箱" in fname(s) or "小爱" in fname(s))))
+    if _discovered:
+        print(f"[bridge] 设备自动发现 {len(_discovered)} 项："
+              + " ".join(sorted(_discovered.values())), flush=True)
+    return _discovered
 
 
 def _vacuum_shortcut(question: str) -> str | None:
@@ -153,7 +240,13 @@ def _vacuum_shortcut(question: str) -> str | None:
         return f"开始扫地了（{cur_cn}），先生。"
     return None  # 其余（问电量/滤网寿命等查询）走模型工具链
 
-ROUTER_INSTRUCTION = (
+def router_instruction() -> str:
+    """快速通道提示词：基础纪律（静态）+ 设备规则（按配置/自动发现的实体渲染）。"""
+    _discover_devices()  # 幂等：config 留空的设备实体在首次渲染时自动从 HA 发现
+    return _ROUTER_BASE + _router_device_rules()
+
+
+_ROUTER_BASE = (
     "你是家庭语音管家的快速通道。\n"
     "日常问题直接回答或调用工具（开灯、调温度、查状态、简单算术、常识问答、"
     "单位换算等），尽量少调用工具，回答口语化、简短。\n"
@@ -173,38 +266,23 @@ ROUTER_INSTRUCTION = (
     "能力清单（必须用工具查，不要凭记忆编）：\n"
     "· 时间/日期/星期：用 get_now_time 工具（不要自己编时间）。\n"
     "· 天气/气温/下雨/风力/适不适合出门：用 get_weather 工具（含未来几天预报）。\n"
-    "· Mac 电脑电量：get_entity 查 sensor.mac_dian_chi_dian_liang。\n"
+    "· 电脑电量：用 search_entities_tool 找名字带「电量/电池」的传感器，再用 get_entity 查。\n"
     "· 电脑上的文件/文件夹：用 list_computer_files（看目录里有什么）、"
     "read_computer_file（读文件内容）、search_computer_files（按名字找文件）。"
     "「桌面有什么」「下载里有什么」「某个文件写了什么」「找某个文件」直接查，不要推脱。\n"
     "· 家里的设备状态与控制：用 get_entity / entity_action / list_entities / search_entities_tool。\n"
     "· 设备指令（开灯/关灯/打开/关闭/调到/温度/模式/风速/亮度…）直接执行，"
     "绝不反问「开哪个灯」：\n"
-    "  官方小爱的云端执行链路已被锁定，你就是家里唯一的设备执行者，"
+    "  官方小爱不再出声、不再执行，你就是家里唯一的设备执行者，"
     "用户说出的每一条设备指令都由你通过 HA 工具（list_entities 查实体 → entity_action 执行）来完成。\n"
-    "  灯的铁律：用户只说「开灯/关灯」没指明哪个灯时，"
-    "只操作大灯本体 = " + MAIN_LIGHT_ENTITY + "（大灯是 switch 实体，"
-    "不是 light 域，别去 light 域乱找）；绝不碰氛围灯，绝不碰任何指示灯。\n"
-    "  用户明说「氛围灯」时操作 " + AMBIENT_LIGHT_ENTITY + "；"
-    "明说其他灯时才按名字找对应实体。"
-    "执行完简短确认（如「灯已经打开了，先生」）；因为垫场词已经说过「好的」，"
-    "你的回复不要以「好的」开头。\n"
-    "  空调的铁律：空调温度只有一个 number 实体 = " + AC_TEMP_ENTITY + "，"
-    "调温度直接用 entity_action 给它 set_value（如 24），绝不按温度±按钮（button ...temperature_up/down），"
-    "绝不反复查询验证（红外空调没有状态回读，查了也没用，查一次实体 ID 就够）。"
-    "「开空调」= 先 press " + AC_TURN_ON_ENTITY + "。\n"
-    "  扫地机器人的铁律（2026-08-23 事故教训）：模式/启动/暂停/停止/回充等指令由桥侧确定性短路"
-     "直接执行，你不需要用工具操作 vacuum.* 或 cleaning_mode 相关实体；"
-     "【绝对禁止】用 native_device_command 转发扫地机器人指令（官方小爱会按默认扫拖乱来）。"
-     "只有查询类问题（电量/滤网寿命/清扫记录）才用工具读实体。\n"
-     "  native_device_command 工具仍然可用（走音箱原生日志通道），"
+    "  native_device_command 工具仍然可用（走音箱原生日志通道），"
     "但首选 HA 的 entity_action（本地直连、状态可回读验证）。\n"
     "· 音量指令（声音调到50%/音量25%/大点声/小声点/音箱音量…）："
     "直接用 set_speaker_volume 工具执行，percent 从用户话里提取；"
     "没指明哪台音箱就调正在说话的这台（which 不传）。"
     "【绝对禁止】反问「您是要调音量吗」「哪台音箱」「调到多少」——直接做。\n"
     "· 播放类需求铁律：用户要求播放某首具体的歌/音乐/音频片段（含歌名、角色名、"
-    "场景名等具体指向，如「播放沃雅妮莎那首俄语歌」），具体歌名一律先调 netease_music_play "
+    "场景名等具体指向，如「播放XX的歌」），具体歌名一律先调 netease_music_play "
     "（网易云正版音源）；网易云失败（搜不到/无版权/风控）再调 web_audio_play；都失败才回一个字：深。"
     "「放每日推荐/放我喜欢的歌」调 netease_music_personal；「放我的XX歌单」调 netease_music_playlist。"
     "白噪音/助眠音/电台调 web_audio_play。"
@@ -229,6 +307,54 @@ ROUTER_INSTRUCTION = (
     "· 涉及用户个人信息或家庭背景（邮箱、电话、姓名、家庭成员的安排、过往约定等）而你记不清的问题；\n"
     "· 任何你没有工具、没把握、拿不准的任务——宁可转交，绝不可回绝用户。"
 )
+
+
+def _router_device_rules() -> str:
+    """设备规则段：只渲染已知的实体（配置或自动发现），不知道的就写通用做法。"""
+    parts = []
+    if MAIN_LIGHT_ENTITY:
+        parts.append(
+            "设备规则（实体已配置/自动发现，直接用，别去搜索）：\n"
+            "  灯的铁律：用户只说「开灯/关灯」没指明哪个灯时，"
+            "只操作主灯 = " + MAIN_LIGHT_ENTITY + "；绝不碰氛围灯，绝不碰任何指示灯。\n"
+        )
+        if AMBIENT_LIGHT_ENTITY:
+            parts.append(
+                "  用户明说「氛围灯」时操作 " + AMBIENT_LIGHT_ENTITY + "；"
+                "明说其他灯时才按名字找对应实体。\n"
+            )
+    else:
+        parts.append(
+            "设备规则：\n"
+            "  灯：用户只说「开灯/关灯」没指明哪个灯时，用 list_entities 找一个"
+            "名字带「灯」且不带「氛围」「指示」的实体操作（优先 switch/light 域），"
+            "绝不反问「开哪个灯」。\n"
+        )
+    if AC_TEMP_ENTITY:
+        rule = (
+            "  空调的铁律：空调温度只有一个 number 实体 = " + AC_TEMP_ENTITY + "，"
+            "调温度直接用 entity_action 给它 set_value（如 24），绝不按温度±按钮，"
+            "绝不反复查询验证（红外空调没有状态回读，查了也没用）。"
+        )
+        if AC_TURN_ON_ENTITY:
+            rule += "「开空调」= 先 press " + AC_TURN_ON_ENTITY + "。\n"
+        else:
+            rule += "\n"
+        parts.append(rule)
+    if VACUUM_ENTITY:
+        parts.append(
+            "  扫地机器人：模式/启动/暂停/停止/回充由桥侧确定性短路直接执行，"
+            "你不需要用工具操作 vacuum.* 或 cleaning_mode 相关实体；"
+            "【绝对禁止】用 native_device_command 转发扫地机器人指令（官方小爱会按默认扫拖乱来）。"
+            "只有查询类问题（电量/滤网寿命/清扫记录）才用工具读实体。\n"
+        )
+    parts.append(
+        "  离线设备原则：get_entity 返回 unavailable 就如实说「XX现在离线了」，"
+        "绝不反复重试、绝不编造。\n"
+        "  执行完简短确认（如「灯已经打开了，先生」）；因为垫场词已经说过「好的」，"
+        "你的回复不要以「好的」开头。\n"
+    )
+    return "".join(parts)
 
 lock = threading.Lock()
 _llm_key: str | None = None
@@ -1798,7 +1924,7 @@ def ask_dsh(question: str, fast: bool, context: str = "") -> str:
     """
     parts = [p for p in (load_persona(),) if p]
     if fast:
-        parts.append(ROUTER_INSTRUCTION)
+        parts.append(router_instruction())
     else:
         parts.append(MEMORY_INSTRUCTION)
         parts.append(EVOLUTION_INSTRUCTION)
@@ -2633,7 +2759,7 @@ def SELF_AWARENESS_TEXT() -> str:
 
 def build_fast_prompt(question: str, pending_ctx: str = "") -> str:
     """组装快速通道提示词：人设 + 路由指令 + 自我认知 + 音箱自己的长期记忆 + 最近话题 + 用户问题。"""
-    sections = [p for p in (load_persona(), ROUTER_INSTRUCTION) if p]
+    sections = [p for p in (load_persona(), router_instruction()) if p]
     sections.append(SELF_AWARENESS_TEXT())
     if pending_ctx:
         sections.append(pending_ctx)  # 上一轮反问的上下文（用户这轮的回答）
@@ -3024,6 +3150,7 @@ def main() -> int:
     if "--port" in sys.argv:
         port = int(sys.argv[sys.argv.index("--port") + 1])
     daily_cleanup()  # 启动时清理过期话题档案与 headless 会话文件
+    _discover_devices()  # config 留空的设备实体自动从 HA 发现（日志见 [bridge] 设备自动发现）
     # 保障音箱项目文件夹有 checkout 的 node_modules（tsx 与依赖解析依赖它）
     nm_link = os.path.join(SPEAKER_HOME, "node_modules")
     if not os.path.islink(nm_link):

@@ -56,16 +56,33 @@ python3 admin/server.py [--port 8390]
 |------|------|------|
 | `ip` | string | Mac 局域网 IP（示例 192.168.1.x，按实际网络填写）。写进音箱端 config.env 的 MAC_IP，直连模式探测用它（4397/healthz） |
 
-### 1.6 `devices` — 关键设备实体（桥的指令铁律引用这些实体）
+### 1.6 `devices` — 关键设备实体
+
+**所有字段都可以留空。** 桥启动时会自动扫描 Home Assistant，按米家设备的命名
+规律自动匹配（空调、塔扇、扫地机、摄像头、名字明显的灯和音箱），发现结果打印
+在桥日志（`[bridge] 设备自动发现 N 项：…`）。只有你家设备改过名字、自动匹配
+不对的时候，才需要在这里手动指一下。已填写的字段永远优先，不会被自动发现覆盖。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `main_light` | string | 大灯 HA entity_id（**switch 实体**，不是 light 域）。ROUTER_INSTRUCTION 铁律：用户只说「开灯/关灯」没指明哪个灯时，只操作大灯本体，绝不碰氛围灯和任何指示灯 |
+| `main_light` | string | 主灯 entity_id。用户只说「开灯/关灯」没指明哪个灯时只操作它，绝不碰氛围灯和任何指示灯 |
 | `ambient_light` | string | 氛围灯 entity_id。用户明说「氛围灯」时才操作 |
 | `speaker_volume` | string | 正在说话的音箱的 media_player entity_id（音量工具 0-100 直调） |
-| `speaker_volume_2` | string | 第二台音量实体（可选，留空则只有一台） |
-| `ac_temperature` | string | 空调温度 number 实体（红外空调唯一温度通道）。铁律：调温度只用它 set_value，绝不按温度±按钮，绝不反复查询验证 |
-| `ac_turn_on` | string | 空调开机 button 实体（「开空调」= 先 press 它） |
+| `speaker_volume_2` | string | 第二台音箱音量实体（可选） |
+| `ac_temperature` | string | 空调温度 number 实体（红外空调唯一温度通道，16-30 度） |
+| `ac_turn_on` / `ac_turn_off` | string | 空调开关机 button 实体（红外独立开关码） |
+| `ac_mode` | string | 空调模式 select 实体（Cool/Heat/Dry/Fan/Auto） |
+| `ac_fan_up` / `ac_fan_down` | string | 空调风速± button 实体 |
+| `fan_entity` | string | 塔扇 fan 实体（风速/摇头/风模式走它） |
+| `fan_delay_entity` | string | 塔扇延时关机 number 实体（0-480 分钟） |
+| `fan_angle_entity` | string | 塔扇扫风夹角 select 实体 |
+| `camera1_on` / `camera2_on` | string | 摄像头电源开关 switch 实体（默认 1 号，明说 2 号才动 2 号） |
+| `vacuum_entity` | string | 扫地机器人 vacuum 实体 |
+| `vacuum_mode_entity` | string | 扫地机器人清扫模式 select 实体（vacuum=只扫/vac_and_mop=扫拖/mop=只拖） |
+
+这些实体被两个地方使用：①桥侧确定性短路（空调/塔扇/扫地机/摄像头的开关与
+参数指令不走模型，正则直连 HA 一次完成）；②快通道提示词里的设备规则
+（按实际配置/发现的实体渲染，没发现的设备写通用做法）。
 
 ### 1.7 `paths` — 本地路径
 

@@ -10,7 +10,7 @@
                不依赖任何平台 API 与登录态（浏览器基础能力）
 
 用法:
-  web-audio-play.py "原神 沃雅妮莎"                    # auto：优先 B站，失败转 generic
+  web-audio-play.py "关键词"                       # auto：优先 B站，失败转 generic
   web-audio-play.py "关键词" --platform bilibili      # 指定平台
   web-audio-play.py "关键词" --list                   # 只列候选，不播
   web-audio-play.py "关键词" --index 2                # 播第 2 个候选
