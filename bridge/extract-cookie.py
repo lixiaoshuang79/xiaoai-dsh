@@ -37,11 +37,16 @@ def main() -> int:
 
     for name, domains in wanted.items():
         for domain, value in domains.items():
-            print(f"  {name} @ {domain} = {value[:12]}…（共 {len(value)} 字符）")
+            print(f"  {name} @ {domain}（共 {len(value)} 字符）")
 
+    # 完整凭据落盘必须 0600（serviceToken/passToken/cUserId 即登录身份）
     with open(OUT, "w") as f:
         json.dump(wanted, f, indent=2)
-    print(f"已保存到 {OUT}")
+    try:
+        os.chmod(OUT, 0o600)
+    except OSError:
+        pass
+    print(f"已保存到 {OUT}（0600）")
     return 0
 
 

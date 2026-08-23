@@ -1,9 +1,15 @@
 # ===== 本地配置与密钥（由 localhost 后台 admin/server.py 生成，绝不提交）=====
 config/local.json
+config/local-admin.token
 config/generated/
-bridge/.env
+# 任何目录下的 .env 都是本机生成（HA 令牌等），绝不提交
+**/.env
 bridge/xiaogpt-credentials
 bridge/xiaogpt-config.yml
+bridge/xiaomi-cookie.json
+bridge/.relay-state.json
+# 桥运行时生成的自我进化工具清单（将移入 SPEAKER_HOME，保险起见仍忽略）
+bridge/evolved-tools.json
 speaker/config.env
 speaker/system_prompt.txt
 
@@ -12,16 +18,22 @@ logs/
 *.log
 __pycache__/
 *.pyc
+*.egg-info
 .venv/
 .venv-*/
 node_modules/
 target/
 migpt/open-xiaoai.node
+# 音箱端 AI 桥客户端二进制（部署到音箱 /data/open-xiaoai/client，本机不入库）
+speaker/client
 .DS_Store
+# 音箱运行时数据（SPEAKER_HOME，含桥自维护历史/话题/待答复/提醒/自我进化产物）
+xiaogpt-speaker/
 
 # ===== 用户私有数据 =====
 speaker-history.jsonl
 speaker-topics.json
+speaker-pending.json
 memories/
 storages/
 sessions/
@@ -34,3 +46,5 @@ client-bin
 
 # ===== 构建工具链（本机符号链接，用户相关，不入库）=====
 .tools/
+
+# ===== 注意：packages/ 是 open-xiaoai（client-rust）vendor 源码，必须提交，勿忽略 =====

@@ -21,18 +21,30 @@ TOKEN_PATH = Path.home() / ".mi.token"
 
 
 def load_env() -> tuple[str, str, str]:
+    """从 xiaogpt-credentials 读账号配置。
+    兼容 admin 后台生成的两种格式：export KEY='单引号' 与 export KEY="双引号"
+    （shlex.quote 输出单引号；旧版用双引号）。"""
+    import shlex
     user = passwd = device_id = ""
     creds = HOME / "xiaogpt-credentials"
     if creds.is_file():
         for line in creds.read_text().splitlines():
-            for key in ("MI_USER", "MI_PASS", "MI_DEVICE_ID"):
-                m = re.match(rf'export\s+{key}="(.*)"', line)
-                if m and key == "MI_USER":
-                    user = m.group(1)
-                elif m and key == "MI_PASS":
-                    passwd = m.group(1)
-                elif m and key == "MI_DEVICE_ID":
-                    device_id = m.group(1)
+            line = line.strip()
+            if not line.startswith("export "):
+                continue
+            try:
+                parts = shlex.split(line[len("export "):])
+            except ValueError:
+                continue
+            if len(parts) != 2 or "=" not in parts[0]:
+                continue
+            key, val = parts[0].split("=", 1)
+            if key == "MI_USER":
+                user = val
+            elif key == "MI_PASS":
+                passwd = val
+            elif key == "MI_DEVICE_ID":
+                device_id = val
     return user, passwd, device_id
 
 
@@ -41,7 +53,7 @@ async def refresh() -> int:
     if not (user and passwd and device_id):
         print("× 缺少账号/密码/设备ID（xiaogpt-credentials）", file=sys.stderr)
         return 1
-    connector = aiohttp.TCPConnector(ssl=False)
+    connector = aiohttp.TCPConnector()  # 默认 TLS 校验（勿关——账号+MD5 哈希在链上传输，关闭校验=中间人可截获重放）
     async with aiohttp.ClientSession(connector=connector) as s:
         cookies = {"sdkVersion": "3.9", "deviceId": device_id, "passToken": ""}
         headers = {"User-Agent": "MiServiceFork/2.9.2"}
@@ -71,7 +83,9 @@ async def refresh() -> int:
         os.system(f'chflags nouchg "{TOKEN_PATH}" 2>/dev/null')
         TOKEN_PATH.write_text(json.dumps(token, indent=2))
         TOKEN_PATH.chmod(0o600)
-        Path(str(TOKEN_PATH) + ".bak").write_text(json.dumps(token, indent=2))
+        bak = Path(str(TOKEN_PATH) + ".bak")
+        bak.write_text(json.dumps(token, indent=2))
+        bak.chmod(0o600)  # 备份文件同样 0600（含完整登录凭据）
         os.system(f'chflags uchg "{TOKEN_PATH}" 2>/dev/null')
         print(f"✓ 令牌已静默刷新（无需手机确认），保存到 {TOKEN_PATH}")
         return 0

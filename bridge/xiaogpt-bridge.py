@@ -12,18 +12,26 @@
 """
 import concurrent.futures
 import datetime
+import hmac
+import ipaddress
 import json
 import os
+import random
 import re
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from config_loader import cfg_llm, cfg_ha, cfg_devices, cfg_paths, repo_root
+from config_loader import (
+    ConfigError, cfg_llm, cfg_ha, cfg_devices, cfg_paths, cfg_playback,
+    cfg_bridge_secret, is_example, repo_root,
+)
 
 PORT = 8322
 _BRIDGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,9 +62,8 @@ TOPIC_HISTORY_ROUNDS = 3  # 继续话题时注入最近几轮问答
 # 把反问全文注入上下文，让小爱理解「A」是对上一轮反问的回答
 PENDING_FILE = os.path.join(SPEAKER_HOME, "speaker-pending.json")
 PENDING_TTL_SECONDS = 10 * 60
-# 音箱专用技能库与工具库（仓库内，只归音箱助手使用，不污染用户的 DSH）
+# 音箱专用技能库（仓库内人工维护的只读精选；模型沉淀的技能写 RUNTIME_SKILLS_DIR）
 SKILLS_DIR = os.path.join(_REPO_ROOT, "skills", "speaker-skills")
-EVOLVED_TOOLS_FILE = os.path.join(_BRIDGE_DIR, "evolved-tools.json")
 # 音箱自己的长期记忆（Memory Evolve，存于隔离 home）；用户 DSH 主记忆（只读兜底）
 SPEAKER_MEMORY_DIR = os.path.join(DSH_HOME_SPEAKER, "memories")
 USER_MAIN_MEMORY_DIR = os.path.expanduser("~/.dsh/memories")
@@ -86,6 +93,157 @@ FAN_DELAY_ENTITY = cfg_devices("fan_delay_entity") or ""
 FAN_ANGLE_ENTITY = cfg_devices("fan_angle_entity") or ""
 CAM1_ON_ENTITY = cfg_devices("camera1_on") or ""
 CAM2_ON_ENTITY = cfg_devices("camera2_on") or ""
+
+# ---------- 运行时数据目录（自我进化产物与状态文件的落盘位置） ----------
+# 公开仓库里 skills/speaker-skills 是人工维护的只读精选技能；模型沉淀的技能/工具
+# 一律写运行时数据目录（SPEAKER_HOME 下），绝不写回公开仓库（防 git dirty 与
+# prompt injection 污染）。Evolved tools 同理不再放 bridge/。
+RUNTIME_DIR = os.path.join(SPEAKER_HOME, "runtime")
+RUNTIME_SKILLS_DIR = os.path.join(RUNTIME_DIR, "speaker-skills")
+EVOLVED_TOOLS_FILE = os.path.join(RUNTIME_DIR, "evolved-tools.json")
+_REMINDERS_FILE = os.path.join(RUNTIME_DIR, "reminders.json")
+
+# ---------- 桥鉴权 secret（本机随机/配置生成，migpt 与桥共用） ----------
+BRIDGE_SECRET = cfg_bridge_secret()
+# 4299 之后 migpt 的 /play /play_url /native /exec 也要求同一 secret
+
+# ---------- 播放 URL 安全策略（SSRF 防护） ----------
+# 默认放行私网 LAN（音箱播放的 relay URL = http://<Mac-IP>:4378/stream 是私网地址，
+# 属正常链路）；loopback/link-local/metadata 永远拒绝。
+# playback.allow_private_urls=false 可开严格模式（连私网 LAN 也拒绝）。
+ALLOW_PRIVATE_URLS = bool(cfg_playback("allow_private_urls", True))
+MAX_URL_LEN = 2048
+_URL_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_URL_WHITESPACE_RE = re.compile(r"\s")
+
+
+def _url_host_ip(hostname: str):
+    """解析主机名对应的 IP 集合（用于 DNS 解析后校验，尽力而为）。"""
+    try:
+        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+        return {info[4][0] for info in infos}
+    except OSError:
+        return set()
+
+
+def _is_private_ip(ip: str) -> bool:
+    """判断 IP 是否私网 LAN（192.168/16、10/8、172.16/12）。
+    仅用于严格模式（playback.allow_private_urls=false）下拒绝私网播放地址；
+    loopback/link-local/metadata 由 _is_loopback_or_linklocal 单独判定。"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return bool(addr.is_private)
+
+
+def _is_loopback_or_linklocal(ip: str) -> bool:
+    """仅 loopback/link-local/metadata/未指定（私网 LAN 放行——音箱播放的
+    relay URL 就是 http://<Mac局域网IP>:4378/stream，属正常链路）。"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return bool(addr.is_loopback or addr.is_link_local or addr.is_unspecified
+                or addr.is_multicast or addr.is_reserved
+                or str(addr) == "169.254.169.254")
+
+
+def validate_audio_url(url: str) -> str | None:
+    """校验由音箱播放的 URL（migpt /play_url 链路）。
+
+    拒绝：非 http/https、userinfo（凭据泄露面）、控制/空白字符、超长、
+    localhost / loopback（127.0.0.0/8、::1、0.0.0.0）/ link-local
+    （169.254.0.0/16、fe80::，含云 metadata 169.254.169.254）/ 未指定。
+
+    放行：公网 + 私网 LAN（192.168/16、10/8、172.16/12）——音箱播放的
+    直连 relay URL（http://<Mac-IP>:4378/stream）就是私网地址，属正常链路；
+    私网放行也可配置关闭（playback.allow_private_urls=false，严格模式）。
+
+    Mac 侧真正的高危 SSRF 面（relay 拉取任意 URL、可达 127.0.0.1:8123 等）
+    由 web-audio-play.py 的 relay 校验兜底（那里拒绝全部私网）。"""
+    if not url or not isinstance(url, str):
+        return None
+    if len(url) > MAX_URL_LEN:
+        return None
+    if _URL_CTRL_RE.search(url) or _URL_WHITESPACE_RE.search(url):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https"):
+        return None
+    if parsed.username or parsed.password or parsed.netloc.startswith("@"):
+        return None  # userinfo 一律拒绝（凭据泄露面）
+    host = parsed.hostname or ""
+    if not host:
+        return None
+    host_l = host.lower()
+    if host_l in ("localhost", "localhost.localdomain"):
+        return None
+    # IPv6/IPv4 字面量直接判；域名解析后逐个判（尽力而为）
+    try:
+        probe = ipaddress.ip_address(host)
+        if _is_loopback_or_linklocal(str(probe)):
+            return None
+        if not ALLOW_PRIVATE_URLS and _is_private_ip(str(probe)):
+            return None
+        return url
+    except ValueError:
+        pass  # 不是 IP 字面量，按域名处理
+    ips = _url_host_ip(host)
+    if ips:
+        for ip in ips:
+            if _is_loopback_or_linklocal(ip):
+                return None
+            if not ALLOW_PRIVATE_URLS and _is_private_ip(ip):
+                return None
+        return url
+    return None  # 域名解析失败：宁缺毋滥
+
+
+# ---------- 原子写与状态锁（防进程 crash 留半文件；并发访问有锁） ----------
+
+_state_lock = threading.Lock()  # 话题/待答复/提醒等状态文件的全局互斥
+
+
+def atomic_write_text(path: str, content: str) -> None:
+    """原子写文本：同目录 tmp + fsync + os.replace（同文件系统 rename 原子）。"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp-" + str(os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def atomic_write_json(path: str, obj) -> None:
+    """原子写 JSON（indent=2，ensure_ascii=False）。"""
+    atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=2) + "\n")
+
+
+# ---------- 对话代际（turn_id）：进程内单调递增，深任务捕获自己的代际 ----------
+# 判定「深任务结果是否仍属于当前轮次」用进程内计数器，绝不读历史文件猜——
+# 历史文件会被旧任务的 record_history 覆盖，导致更晚的 Q2 被错误判过期。
+
+_turn_seq = 0
+_turn_seq_lock = threading.Lock()
+
+
+def next_turn() -> int:
+    """每次新用户轮次分配一个单调递增的 turn_id（线程安全）。"""
+    global _turn_seq
+    with _turn_seq_lock:
+        _turn_seq += 1
+        return _turn_seq
+
+
+def current_turn() -> int:
+    """当前最新 turn_id（后台深任务完成时用它判断自己是否仍 relevant）。"""
+    with _turn_seq_lock:
+        return _turn_seq
 
 
 def _ha_state(entity_id: str) -> dict:
@@ -119,9 +277,33 @@ def _ha_states_all() -> list:
         return []
 
 
+def _ha_entity_registry() -> dict:
+    """拉取 HA 实体注册表（entity_id → device_id 映射）。
+    失败返回空 dict——发现逻辑退化为「按全局唯一性兜底」，不致命。"""
+    try:
+        req = urllib.request.Request(
+            f"{_load_env('HA_URL')}/api/config/entity_registry/list",
+            headers={"Authorization": f"Bearer {_load_env('HA_TOKEN')}"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            entries = json.loads(resp.read().decode("utf-8"))
+        out = {}
+        for e in entries:
+            if isinstance(e, dict) and e.get("entity_id"):
+                out[e["entity_id"]] = e.get("device_id") or ""
+        return out
+    except Exception:
+        return {}
+
+
 def _discover_devices(force: bool = False) -> dict:
     """把 config 留空的设备实体自动填上（幂等，启动时调用一次即可）。
-    返回本次发现结果 {常量名: entity_id}。"""
+    返回本次发现结果 {常量名: entity_id}。
+
+    防串台（#10）：候选实体先按 HA entity_registry 的 device_id 分组，
+    只有「同一个设备」同时满足该设备的完整特征（如红外空调 = 温度 number +
+    模式 select + 开关 button 都在同一 device）才绑定；多设备都符合时宁缺毋滥，
+    留空并输出诊断日志（提示用户到 config/devices 显式配置），绝不跨设备拼凑。"""
     global _discovery_done
     if _discovery_done and not force:
         return _discovered
@@ -129,15 +311,31 @@ def _discover_devices(force: bool = False) -> dict:
     states = _ha_states_all()
     if not states:
         return _discovered
+    registry = _ha_entity_registry()
+
+    by_id: dict = {}  # device_id -> {entity_id: state}
+    orphan = []       # 无 device_id 的实体
+    for s in states:
+        eid = s.get("entity_id", "")
+        if not eid:
+            continue
+        dev = registry.get(eid, "")
+        if dev:
+            by_id.setdefault(dev, {})[eid] = s
+        else:
+            orphan.append(s)
+
+    def alive(s) -> bool:
+        return s.get("state") not in ("unavailable", "unknown")
 
     def fname(s) -> str:
         return (s.get("attributes") or {}).get("friendly_name") or ""
 
-    def find(pred) -> str:
-        cands = [s for s in states if pred(s)]
-        alive = [s for s in cands if s.get("state") not in ("unavailable", "unknown")]
-        if alive:
-            cands = alive
+    def pick_from(group: dict, pred) -> str:
+        cands = [s for s in group.values() if pred(s)]
+        alive_c = [s for s in cands if alive(s)]
+        if alive_c:
+            cands = alive_c
         return cands[0]["entity_id"] if cands else ""
 
     def fill(attr: str, value: str) -> None:
@@ -145,43 +343,114 @@ def _discover_devices(force: bool = False) -> dict:
             globals()[attr] = value
             _discovered[attr] = value
 
-    # 塔扇：fan 域、优先带预设风模式（直吹/自然/睡眠风）的
-    fill("FAN_ENTITY",
-         find(lambda s: s["entity_id"].startswith("fan.") and bool((s.get("attributes") or {}).get("preset_modes")))
-         or find(lambda s: s["entity_id"].startswith("fan.")))
-    fill("FAN_DELAY_ENTITY", find(lambda s: s["entity_id"].startswith("number.") and "off_delay_time" in s["entity_id"]))
-    fill("FAN_ANGLE_ENTITY", find(lambda s: s["entity_id"].startswith("select.") and "swing" in s["entity_id"]))
-    # 红外空调（米家红外遥控命名）：温度 number / 模式 select / 开关与风速 button
-    fill("AC_TEMP_ENTITY", find(lambda s: s["entity_id"].startswith("number.") and "ir_temperature" in s["entity_id"]))
-    fill("AC_MODE_ENTITY", find(lambda s: s["entity_id"].startswith("select.") and "ir_mode" in s["entity_id"]))
-    fill("AC_TURN_ON_ENTITY", find(lambda s: s["entity_id"].startswith("button.") and "turn_on" in s["entity_id"]))
-    fill("AC_TURN_OFF_ENTITY", find(lambda s: s["entity_id"].startswith("button.") and "turn_off" in s["entity_id"]))
-    fill("AC_FAN_UP_ENTITY", find(lambda s: "fan_speed_up" in s["entity_id"]))
-    fill("AC_FAN_DOWN_ENTITY", find(lambda s: "fan_speed_down" in s["entity_id"]))
-    # 摄像头：电源开关 = switch 域 + 实体 ID 以 on_p_2_1 结尾 + 名字/ID 含摄像；
-    # 不用名字里带「开关」匹配——异响检测/区域显示等一堆配置开关都带这两个字
-    cams = sorted(s["entity_id"] for s in states
-                  if s["entity_id"].startswith("switch.")
-                  and s["entity_id"].endswith("on_p_2_1")
-                  and ("摄像" in fname(s) or "摄像" in s["entity_id"]))
-    if len(cams) >= 1:
-        fill("CAM1_ON_ENTITY", cams[0])
-    if len(cams) >= 2:
-        fill("CAM2_ON_ENTITY", cams[1])
-    # 扫地机器人：vacuum 域 + cleaning_mode 模式 select
-    fill("VACUUM_ENTITY", find(lambda s: s["entity_id"].startswith("vacuum.")))
-    fill("VACUUM_MODE_ENTITY", find(lambda s: s["entity_id"].startswith("select.") and "cleaning_mode" in s["entity_id"]))
-    # 灯：只认名字明显的（吸顶灯/大灯/主灯、氛围灯），找不到就留空走通用规则
+    def log_ambiguous(kind: str, cands: list) -> None:
+        print(f"[bridge] 设备自动发现: {kind} 有多个候选设备，为避免串台不自动绑定，"
+              f"请到 config/devices 显式配置（候选: {', '.join(cands[:4])}）",
+              flush=True)
+
+    # —— 红外空调：特征 = number.ir_temperature + select.ir_mode + button.turn_on/off 同设备 ——
+    ac_groups = []
+    for dev, group in by_id.items():
+        has_temp = any("ir_temperature" in e for e in group)
+        has_mode = any("ir_mode" in e for e in group)
+        has_on = any("turn_on" in e for e in group)
+        has_off = any("turn_off" in e for e in group)
+        if has_temp and has_mode and (has_on or has_off):
+            ac_groups.append((dev, group))
+    if ac_groups:
+        if len(ac_groups) == 1:
+            _, g = ac_groups[0]
+            fill("AC_TEMP_ENTITY", pick_from(g, lambda s: "ir_temperature" in s["entity_id"]))
+            fill("AC_MODE_ENTITY", pick_from(g, lambda s: "ir_mode" in s["entity_id"]))
+            fill("AC_TURN_ON_ENTITY", pick_from(g, lambda s: "turn_on" in s["entity_id"]))
+            fill("AC_TURN_OFF_ENTITY", pick_from(g, lambda s: "turn_off" in s["entity_id"]))
+            fill("AC_FAN_UP_ENTITY", pick_from(g, lambda s: "fan_speed_up" in s["entity_id"]))
+            fill("AC_FAN_DOWN_ENTITY", pick_from(g, lambda s: "fan_speed_down" in s["entity_id"]))
+        else:
+            log_ambiguous("红外空调", [f"{g[0][:24]}…" for g in ac_groups])
+    # 兼容旧形态：实体没有 device_id（孤儿）时仍按全局唯一性兜底（单候选才绑）
+    if not _discovered.get("AC_TEMP_ENTITY") and orphan:
+        ac_cands = [s for s in orphan
+                    if "ir_temperature" in s["entity_id"]]
+        if len(ac_cands) == 1:
+            fill("AC_TEMP_ENTITY", ac_cands[0]["entity_id"])
+            fill("AC_MODE_ENTITY", pick_from({s["entity_id"]: s for s in orphan},
+                                             lambda s: "ir_mode" in s["entity_id"]))
+            fill("AC_TURN_ON_ENTITY", pick_from({s["entity_id"]: s for s in orphan},
+                                                lambda s: "turn_on" in s["entity_id"]))
+            fill("AC_TURN_OFF_ENTITY", pick_from({s["entity_id"]: s for s in orphan},
+                                                 lambda s: "turn_off" in s["entity_id"]))
+
+    # —— 塔扇：fan 域 + 同设备带 preset_modes / off_delay_time / swing ——
+    fan_groups = []
+    for dev, group in by_id.items():
+        fans = {e: s for e, s in group.items() if e.startswith("fan.")}
+        if fans:
+            fan_groups.append((dev, group))
+    if fan_groups:
+        if len(fan_groups) == 1:
+            _, g = fan_groups[0]
+            fill("FAN_ENTITY",
+                 pick_from(g, lambda s: s["entity_id"].startswith("fan.")
+                           and bool((s.get("attributes") or {}).get("preset_modes")))
+                 or pick_from(g, lambda s: s["entity_id"].startswith("fan.")))
+            fill("FAN_DELAY_ENTITY",
+                 pick_from(g, lambda s: "off_delay_time" in s["entity_id"]))
+            fill("FAN_ANGLE_ENTITY",
+                 pick_from(g, lambda s: "swing" in s["entity_id"]))
+        else:
+            log_ambiguous("塔扇", [f"{g[0][:24]}…" for g in fan_groups])
+    if not _discovered.get("FAN_ENTITY") and orphan:
+        fans = [s for s in orphan if s["entity_id"].startswith("fan.")]
+        if len(fans) == 1:
+            fill("FAN_ENTITY", fans[0]["entity_id"])
+
+    # —— 摄像头：switch 域 + on_p_2_1 结尾 + 名字含摄像，按设备分组 ——
+    cam_devs = []
+    for dev, group in by_id.items():
+        cams = sorted(e for e in group
+                      if e.startswith("switch.") and e.endswith("on_p_2_1")
+                      and ("摄像" in fname(group[e]) or "摄像" in e))
+        if cams:
+            cam_devs.append((dev, cams))
+    if len(cam_devs) == 1:
+        _, cams = cam_devs[0]
+        if cams:
+            fill("CAM1_ON_ENTITY", cams[0])
+        if len(cams) >= 2:
+            fill("CAM2_ON_ENTITY", cams[1])
+    elif len(cam_devs) > 1:
+        log_ambiguous("摄像头", [f"{d[:24]}…" for d, _ in cam_devs])
+
+    # —— 扫地机器人：vacuum 域 + cleaning_mode 模式 select，同设备分组 ——
+    vac_groups = []
+    for dev, group in by_id.items():
+        vacs = {e: s for e, s in group.items() if e.startswith("vacuum.")}
+        if vacs:
+            vac_groups.append((dev, group))
+    if vac_groups:
+        if len(vac_groups) == 1:
+            _, g = vac_groups[0]
+            fill("VACUUM_ENTITY", pick_from(g, lambda s: s["entity_id"].startswith("vacuum.")))
+            fill("VACUUM_MODE_ENTITY",
+                 pick_from(g, lambda s: "cleaning_mode" in s["entity_id"]))
+        else:
+            log_ambiguous("扫地机器人", [f"{g[0][:24]}…" for g in vac_groups])
+
+    # —— 灯：只认名字明显的（吸顶灯/大灯/主灯、氛围灯），找不到就留空走通用规则 ——
     fill("MAIN_LIGHT_ENTITY",
-         find(lambda s: s["entity_id"].startswith(("switch.", "light."))
-              and ("吸顶灯" in fname(s) or "大灯" in fname(s) or "主灯" in fname(s))
-              and "氛围" not in fname(s) and "指示" not in fname(s)
-              and "indicator" not in s["entity_id"]))
-    fill("AMBIENT_LIGHT_ENTITY", find(lambda s: "氛围灯" in fname(s)))
+         pick_from({s["entity_id"]: s for s in states},
+                   lambda s: s["entity_id"].startswith(("switch.", "light."))
+                   and ("吸顶灯" in fname(s) or "大灯" in fname(s) or "主灯" in fname(s))
+                   and "氛围" not in fname(s) and "指示" not in fname(s)
+                   and "indicator" not in s["entity_id"]))
+    fill("AMBIENT_LIGHT_ENTITY",
+         pick_from({s["entity_id"]: s for s in states}, lambda s: "氛围灯" in fname(s)))
     # 音箱音量：media_player 名字带「音箱/小爱」的第一台
     fill("SPEAKER_PLAYER",
-         find(lambda s: s["entity_id"].startswith("media_player.")
-              and ("音箱" in fname(s) or "小爱" in fname(s))))
+         pick_from({s["entity_id"]: s for s in states},
+                   lambda s: s["entity_id"].startswith("media_player.")
+                   and ("音箱" in fname(s) or "小爱" in fname(s))))
     if _discovered:
         print(f"[bridge] 设备自动发现 {len(_discovered)} 项："
               + " ".join(sorted(_discovered.values())), flush=True)
@@ -961,7 +1230,8 @@ def native_device_command(command: str) -> str:
     payload = json.dumps({"text": command, "silent": True}, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         MIGPT_NATIVE_URL, payload,
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {BRIDGE_SECRET}"}, method="POST")
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read().decode("utf-8"))
     return "原生小爱已执行" if data.get("ok") else "原生执行失败"
@@ -993,7 +1263,9 @@ COMPUTER_ROOT = os.path.expanduser("~")
 # 涉及隐私/密钥的目录一律不许进（只读工具也不许看）
 COMPUTER_BLOCKED = [
     ".ssh", ".dsh", ".gnupg", ".aws", ".credentials.yaml", ".zsh_history",
-    ".bash_history", "Library/Keychains", "Library/Cookies", "Library/Logs",
+    ".bash_history", ".git", ".config", ".netrc", ".npmrc",
+    ".gitconfig", ".git-credentials", ".zshrc", ".bashrc", ".zprofile",
+    "Library/Keychains", "Library/Cookies", "Library/Logs",
     "Library/Mail", "Library/Safari", "Library/Application Support/Google",
     "Library/Application Support/Firefox", "Library/Application Support/Arc",
     "Library/Containers/com.apple.mail",
@@ -1001,17 +1273,34 @@ COMPUTER_BLOCKED = [
 
 
 def _resolve_computer_path(raw: str) -> str:
-    """把用户/模型给的路径规整成绝对路径，限制在 Mac 主目录内。"""
+    """把用户/模型给的路径规整成绝对路径，限制在 Mac 主目录内。
+
+    防 symlink 逃逸（TOCTOU）：沿**原始路径**在根目录之下的每个分量
+    lstat，任何分量是符号链接都拒绝——realpath 会把链接解析掉，必须先
+    于 realpath 检查。根目录自身之上的系统符号链接（如 macOS /var →
+    /private/var）属可信系统路径，不检查。
+    """
     raw = (raw or "").strip()
     if not raw:
         raw = COMPUTER_ROOT
     raw = os.path.expanduser(raw)
     if not raw.startswith("/"):
         raw = os.path.join(COMPUTER_ROOT, raw)
-    real = os.path.realpath(raw)
+    norm = os.path.normpath(raw)  # 不解析 symlink，只规整 ../ 等
+    root_raw = os.path.normpath(COMPUTER_ROOT)
     root_real = os.path.realpath(COMPUTER_ROOT)
+    real = os.path.realpath(norm)
     if real != root_real and not real.startswith(root_real + "/"):
         raise ValueError("路径越界")
+    # 逐分量 symlink 检查（原始路径，root_raw 之下）
+    if norm.startswith(root_raw + "/"):
+        rel_raw = norm[len(root_raw):].strip("/")
+        if rel_raw:
+            cur = root_raw
+            for part in rel_raw.split("/"):
+                cur = os.path.join(cur, part)
+                if os.path.islink(cur):
+                    raise ValueError("路径包含符号链接，拒绝访问")
     rel = real[len(root_real):].strip("/")
     for blocked in COMPUTER_BLOCKED:
         if rel == blocked or rel.startswith(blocked + "/"):
@@ -1020,7 +1309,8 @@ def _resolve_computer_path(raw: str) -> str:
 
 
 def list_computer_files(path: str = "") -> str:
-    """列出 Mac 电脑上某目录的文件（名字、大小、修改时间），供语音回答。"""
+    """列出 Mac 电脑上某目录的文件（名字、大小、修改时间），供语音回答。
+    隐藏文件（点开头）默认不列出（避免把 .ssh/.git 等敏感名字暴露给模型）。"""
     try:
         real = _resolve_computer_path(path)
     except ValueError as e:
@@ -1031,8 +1321,11 @@ def list_computer_files(path: str = "") -> str:
         entries = sorted(os.listdir(real), key=str.lower)
     except OSError as e:
         return f"[读取失败: {e}]"
-    lines = [f"目录 {real} 共 {len(entries)} 项："]
-    for name in entries[:60]:
+    visible = [n for n in entries if not n.startswith(".")]
+    hidden_n = len(entries) - len(visible)
+    lines = [f"目录 {real} 共 {len(visible)} 项"
+             + (f"（另有 {hidden_n} 个隐藏文件未列出）" if hidden_n else "") + "："]
+    for name in visible[:60]:
         full = os.path.join(real, name)
         try:
             st = os.lstat(full)
@@ -1042,8 +1335,8 @@ def list_computer_files(path: str = "") -> str:
         size = f"{st.st_size // 1024}KB" if st.st_size >= 1024 else f"{st.st_size}B"
         mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime("%m-%d")
         lines.append(f"- {name}（{kind}，{size}，{mtime}）")
-    if len(entries) > 60:
-        lines.append(f"…其余 {len(entries) - 60} 项未列出")
+    if len(visible) > 60:
+        lines.append(f"…其余 {len(visible) - 60} 项未列出")
     return "\n".join(lines)
 
 
@@ -1059,8 +1352,15 @@ def read_computer_file(path: str) -> str:
         size = os.path.getsize(real)
         if size > 8 * 1024 * 1024:
             return f"[文件太大（{size // 1024 // 1024}MB），不读]"
-        with open(real, encoding="utf-8", errors="replace") as f:
-            content = f.read(8 * 1024)
+        # O_NOFOLLOW：校验后到打开之间若被换成符号链接，打开即失败（防 TOCTOU）
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(real, flags)
+        try:
+            with os.fdopen(fd, encoding="utf-8", errors="replace") as f:
+                content = f.read(8 * 1024)
+        except Exception:
+            os.close(fd)
+            raise
     except OSError as e:
         return f"[读取失败: {e}]"
     head = content if len(content) < 8 * 1024 else content + "\n…（内容截断）"
@@ -1087,7 +1387,7 @@ def search_computer_files(keyword: str, under: str = "") -> str:
         if not os.path.isdir(base):
             continue
         for root, dirs, files in os.walk(base):
-            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
             for name in files + dirs:
                 if kw.lower() in name.lower():
                     hits.append(os.path.join(root, name))
@@ -1203,10 +1503,14 @@ _last_music_url = ""  # 最近一次播放的音频 URL（继续播放用）
 _pending_play = None  # (url, title)：工具找到的音频，等 AI 回答播报完后再播放
 
 
-def _queue_play(url: str, title: str) -> None:
-    """登记待播放音频：不立即播放，等 Flash 确认语播报结束后由 _flush_pending_play 播放。"""
+def _queue_play(url: str, title: str) -> str | None:
+    """登记待播放音频：不立即播放，等 Flash 确认语播报结束后由 _flush_pending_play 播放。
+    返回 None（成功）或错误说明（URL 校验失败时拒绝登记）。"""
+    if validate_audio_url(url) is None:
+        return "[播放失败: URL 不合法或指向内网/本机地址]"
     global _pending_play
     _pending_play = (url, title)
+    return None
 
 
 def _flush_pending_play() -> None:
@@ -1216,12 +1520,18 @@ def _flush_pending_play() -> None:
         return
     url, title = _pending_play
     _pending_play = None
+    # 推送前二次校验（登记后到推送间可能被并发改动）
+    if validate_audio_url(url) is None:
+        print(f"[bridge] 播放推送被拒绝(URL 校验失败): {title[:40]}", flush=True)
+        return
     _last_music_url = url
     try:
         payload = json.dumps({"url": url}).encode("utf-8")
         req = urllib.request.Request(
             MIGPT_PLAY_URL_BASE + "/play_url", payload,
-            headers={"Content-Type": "application/json"}, method="POST")
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {BRIDGE_SECRET}"},
+            method="POST")
         with urllib.request.urlopen(req, timeout=30) as resp:
             resp.read()
         print(f"[bridge] 播放已推送: {title[:40]}", flush=True)
@@ -1247,7 +1557,9 @@ def web_audio_play(query: str) -> str:
         detail = out.strip().splitlines()[-1:] or ["无输出"]
         return f"[播放失败] {detail[0][:120]}"
     title = title_m.group(1).strip() if title_m else ""
-    _queue_play(m.group(1), title)
+    err = _queue_play(m.group(1), title)
+    if err:
+        return err  # URL 校验失败（内网/本机地址等）：如实告知，不登记播放
     return f"已找到：{title}" if title else "已找到音频资源"
 
 
@@ -1342,13 +1654,14 @@ def netease_music_play(query: str) -> str:
             song = _netease_pick_song(songs, query)
             if song:
                 url = _netease_get_url(song["id"])
-                _queue_play(url, f"{song.get('name', '')} - {song.get('artists', '')}")
-                name = song.get("name", "")
-                artists = str(song.get("artists") or "").replace("/", "、")
-                return f"已找到：{name}" + (f" - {artists}" if artists else "")
+                err = _queue_play(url, f"{song.get('name', '')} - {song.get('artists', '')}")
+                if not err:
+                    name = song.get("name", "")
+                    artists = str(song.get("artists") or "").replace("/", "、")
+                    return f"已找到：{name}" + (f" - {artists}" if artists else "")
     except (RuntimeError, json.JSONDecodeError, KeyError, OSError) as e:
         print(f"[bridge] 网易云失败({str(e)[:80]})，降级B站: {query[:30]}", flush=True)
-    # 无版权/搜不到/接口失败 → 自动降级 B 站搜索
+    # 无版权/搜不到/接口失败/URL 校验失败 → 自动降级 B 站搜索
     return web_audio_play(query)
 
 
@@ -1382,7 +1695,9 @@ def netease_music_personal(which: str) -> str:
                 return "[网易云] 每日推荐拿不到"
             song = _netease_pick_song(songs, "") or songs[0]
             url = _netease_get_url(song["id"])
-            _queue_play(url, f"{song.get('name', '')} - {song.get('artists', '')}")
+            err = _queue_play(url, f"{song.get('name', '')} - {song.get('artists', '')}")
+            if err:
+                return err
             return f"已找到每日推荐：{song.get('name', '')}"
         if which == "liked":
             out = _netease_run(["liked", "--limit", "10"])
@@ -1391,7 +1706,9 @@ def netease_music_personal(which: str) -> str:
                 return "[网易云] 红心列表拿不到"
             song = _netease_pick_song(songs, "") or random.choice(songs)
             url = _netease_get_url(song["id"])
-            _queue_play(url, f"{song.get('name', '')} - {song.get('artists', '')}")
+            err = _queue_play(url, f"{song.get('name', '')} - {song.get('artists', '')}")
+            if err:
+                return err
             return f"已找到您红心的歌：{song.get('name', '')}"
         return "[参数错误] which 只支持 daily/liked/playlists"
     except (RuntimeError, json.JSONDecodeError, KeyError, OSError) as e:
@@ -1416,7 +1733,9 @@ def netease_music_playlist(name_or_id: str) -> str:
             return f"[网易云] 歌单「{target['name']}」是空的"
         song = _netease_pick_song(songs, "") or songs[0]
         url = _netease_get_url(song["id"])
-        _queue_play(url, f"{song.get('name', '')} - {song.get('artists', '')}")
+        err = _queue_play(url, f"{song.get('name', '')} - {song.get('artists', '')}")
+        if err:
+            return err
         return f"已找到歌单「{target['name']}」的第一首：{song.get('name', '')}"
     except (RuntimeError, json.JSONDecodeError, KeyError, OSError) as e:
         return f"[网易云失败] {str(e)[:120]}"
@@ -1513,8 +1832,15 @@ def speaker_music_control(action: str) -> str:
                "for i in 1 2 3 4 5; do kill -9 $(/bin/pidof miplayer) 2>/dev/null; "
                "/bin/pidof miplayer >/dev/null 2>&1 || break; sleep 0.3; done; true")
     elif action == "resume" and _last_music_url:
-        # 继续 = 重新拉上次的流（miplayer 无 resume，直接重播）
-        cmd = f"( miplayer -f '{_last_music_url}' >/dev/null 2>&1 & )"
+        # 继续 = 重新拉上次的流（miplayer 无 resume，直接重播）。
+        # URL 登记/推送时已过 SSRF 校验；这里二次校验并做单引号转义
+        # （URL 必须 http(s) 且不含 ' 等 shell 元字符），杜绝注入。
+        url = _last_music_url
+        if (validate_audio_url(url) is None
+                or "'" in url or '"' in url or "$" in url or "\\" in url):
+            print(f"[bridge] resume 拒绝不安全 URL: {_safe_url(url)}", flush=True)
+            return "[操作失败] 上次的播放地址不安全，无法继续"
+        cmd = f"( miplayer -f '{url}' >/dev/null 2>&1 & )"
     elif action == "resume":
         return "[暂停中无曲目] 现在没有正在播放的内容"
     else:
@@ -1523,7 +1849,9 @@ def speaker_music_control(action: str) -> str:
         payload = json.dumps({"cmd": cmd}).encode("utf-8")
         req = urllib.request.Request(
             MIGPT_PLAY_URL_BASE + "/exec", payload,
-            headers={"Content-Type": "application/json"}, method="POST")
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {BRIDGE_SECRET}"},
+            method="POST")
         with urllib.request.urlopen(req, timeout=30) as resp:
             d = json.loads(resp.read())
         ok = d.get("ok", True)
@@ -1563,23 +1891,25 @@ SPEAKER_MUSIC_TOOL = {
 
 # ---------- 本地提醒工具（官方小爱已全禁，闹钟/提醒走桥侧队列 + 到点播报） ----------
 
-REMINDER_FILE = os.path.join(SPEAKER_HOME, "speaker-reminders.json")
+REMINDER_FILE = os.path.join(RUNTIME_DIR, "speaker-reminders.json")
 _reminder_lock = threading.Lock()
 
 
 def _load_reminders() -> list:
     try:
         with open(REMINDER_FILE, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
     except (OSError, json.JSONDecodeError):
-        return []
+        pass
+    return []
 
 
 def _save_reminders(items: list) -> None:
     with _reminder_lock:
         try:
-            with open(REMINDER_FILE, "w", encoding="utf-8") as f:
-                json.dump(items, f, ensure_ascii=False, indent=1)
+            atomic_write_json(REMINDER_FILE, items)
         except OSError:
             pass
 
@@ -1623,32 +1953,37 @@ def reminder_cancel(keyword: str = "") -> str:
 
 
 def _reminder_loop() -> None:
-    """后台线程：每 10 秒检查提醒队列，到点推送音箱播报。"""
+    """后台线程：每 10 秒检查提醒队列，到点推送音箱播报。
+    先推送、成功才从文件删除（推送失败保留原条目，下次轮询重试——
+    避免「已删但没播出来」的提醒丢失）。"""
     while True:
         try:
-            due = []
             items = _load_reminders()
             now = datetime.datetime.now()
-            keep = []
-            for it in items:
-                try:
-                    when = datetime.datetime.fromisoformat(it["time"])
-                except ValueError:
-                    continue
-                if when <= now:
-                    due.append(it)
-                else:
-                    keep.append(it)
+            due = [it for it in items
+                   if _reminder_past(it.get("time"), now)]
             if due:
-                _save_reminders(keep)
+                pushed = []
                 for it in due:
                     try:
-                        push_to_migpt(f"先生，提醒您：{it['text']}")
+                        push_to_migpt(f"先生，提醒您：{it.get('text', '')}")
+                        pushed.append(it["id"])
                     except Exception:
-                        pass
+                        print(f"[bridge] 提醒推送失败，保留待重试: {it.get('text', '')[:30]}",
+                              flush=True)
+                if pushed:
+                    _save_reminders([it for it in items if it["id"] not in pushed])
         except Exception:
             pass
         time.sleep(10)
+
+
+def _reminder_past(time_iso: str, now: datetime.datetime) -> bool:
+    """提醒时间是否已到（解析失败视为未到，避免误触发/误删）。"""
+    try:
+        return datetime.datetime.fromisoformat(time_iso) <= now
+    except (TypeError, ValueError):
+        return False
 
 
 REMINDER_SET_TOOL = {
@@ -2097,8 +2432,10 @@ def answer_question(question: str) -> str:
         except Exception as e:
             print(f"[bridge] 深通道失败({type(e).__name__})，大模型纯问答兜底: {question[:40]}", flush=True)
             return ask_llm_plain(question, pending_ctx)
-    if is_question(ans):
-        record_pending(question, ans)  # 反问 → 记录待答复状态
+    # 对话状态与流式路径统一：输出侧意图识别（intent_check_dialogue）判定，
+    # 不再用 is_question 启发式；keep_open 才写 pending，end 清理。
+    dlg_action = intent_check_dialogue(ans)
+    record_pending(question, ans, dlg_action)
     _flush_pending_play()  # 回答播报完成后放音乐（工具已找到的音频）
     return ans
 
@@ -2120,59 +2457,61 @@ def next_filler() -> str:
 
 def extract_and_play(text: str) -> str:
     """从深通道答案中提取【播放】URL 并交给音箱播放，返回去除该行的文本。
-    找不到就原样返回。"""
+    找不到就原样返回。URL 必须通过 SSRF 校验，否则拒绝播放并保留文本。"""
     m = re.search(r"【播放】\s*(https?://[^\s】]+)", text)
     if not m:
         return text
     url = m.group(1)
     cleaned = re.sub(r"\n?【播放】\s*https?://[^\s】]+\n?", "\n", text).strip()
+    if validate_audio_url(url) is None:
+        print(f"[bridge] 拒绝播放内网/非法 URL: {url[:80]}", flush=True)
+        return cleaned + " （播放链接没有通过安全检查，我把文字留给你了。）" if cleaned else cleaned
     try:
         req = urllib.request.Request(
             MIGPT_PLAY_URL.replace("/play", "/play_url"),
             json.dumps({"url": url}).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method="POST")
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {BRIDGE_SECRET}"},
+            method="POST")
         with urllib.request.urlopen(req, timeout=120) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         if data.get("ok"):
-            print(f"[bridge] 音箱播放中: {url[:80]}", flush=True)
+            print(f"[bridge] 音箱播放中: {_safe_url(url)}", flush=True)
         else:
-            print(f"[bridge] 播放失败: {url[:80]} -> {data.get('error', '')}", flush=True)
+            print(f"[bridge] 播放失败: {_safe_url(url)} -> {data.get('error', '')}", flush=True)
             cleaned = cleaned + " （播放没成功，链接留给你了。）" if cleaned else cleaned
     except Exception as e:
-        print(f"[bridge] play_url 异常({type(e).__name__}): {url[:80]}", flush=True)
+        print(f"[bridge] play_url 异常({type(e).__name__}): {_safe_url(url)}", flush=True)
     return cleaned
 
 
-def _history_last_question() -> str:
-    """读历史文件最后一条的 question（判断深任务期间用户是否说了新话）。"""
+def _safe_url(url: str) -> str:
+    """日志脱敏：只打 scheme://host/path，去掉 query（可能含 token/签名）。"""
     try:
-        with open(HISTORY_FILE, encoding="utf-8") as f:
-            lines = f.readlines()
-        if not lines:
-            return ""
-        last = json.loads(lines[-1])
-        return str(last.get("question", ""))
-    except (OSError, json.JSONDecodeError):
-        return ""
+        p = urllib.parse.urlsplit(url)
+        return f"{p.scheme}://{p.netloc}{p.path}"
+    except ValueError:
+        return "(invalid url)"
 
 
-def push_to_migpt(text: str, origin_question: str = "") -> None:
+def push_to_migpt(text: str, turn: int | None = None) -> None:
     """把后台深通道的结果推送到 migpt 服务端补说。
-    origin_question 非空时先做相关性检查：深任务期间用户已开启新对话，
-    就把过期结果丢弃（避免音箱突然冒出过时播报与当前对话叠声）。"""
-    if origin_question:
-        last_q = _history_last_question()
-        if last_q and last_q != origin_question:
-            print(f"[bridge] 深任务完成但用户已说新话，丢弃过期推送: {origin_question[:20]}",
-                  flush=True)
-            return
+    turn 非空时先做相关性检查：后台任务启动后若用户已开启新对话
+    （进程内 turn 代际前进），就把过期结果丢弃（避免音箱突然冒出过时播报
+    与当前对话叠声）。判定用进程内代际，绝不读历史文件猜当前轮次。"""
+    if turn is not None and turn != current_turn():
+        print(f"[bridge] 深任务完成但已开启新对话，丢弃过期推送: turn {turn} < {current_turn()}",
+              flush=True)
+        return
     # 语音场景限制长度，避免一次念太久
     if len(text) > 200:
         text = text[:200] + "。"
     payload = json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         MIGPT_PLAY_URL, payload,
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {BRIDGE_SECRET}"},
+        method="POST")
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
             resp.read()
@@ -2183,19 +2522,24 @@ def push_to_migpt(text: str, origin_question: str = "") -> None:
 
 # ---------- 音箱会话历史（桥自维护） ----------
 
+_history_lock = threading.Lock()
+
+
 def record_history(question: str, answer: str, mode: str) -> None:
-    """把音箱问答写入桥自己的历史文件（不进用户的 DSH 会话列表）。"""
+    """把音箱问答写入桥自己的历史文件（不进用户的 DSH 会话列表）。
+    加锁保证并发 append 不交错（后台深任务与前台流式可能同时写）。"""
     entry = {
         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
         "mode": mode,          # fast / deep
         "question": question,
         "answer": answer[:500],
     }
-    try:
-        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
+    with _history_lock:
+        try:
+            with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
 
 
 # ---------- 话题档案（会话连续性：相关话题续聊，无关新开，过期清理） ----------
@@ -2220,9 +2564,9 @@ def load_topics() -> list:
 
 
 def save_topics(topics: list) -> None:
+    """原子写话题档案（tmp+fsync+rename，防 crash 留半文件）。"""
     try:
-        with open(TOPICS_FILE, "w", encoding="utf-8") as f:
-            json.dump(topics, f, ensure_ascii=False, indent=2)
+        atomic_write_json(TOPICS_FILE, topics)
     except OSError:
         pass
 
@@ -2284,10 +2628,12 @@ def daily_cleanup() -> None:
     cleanup_old_sessions()
 
 
-def topic_choose(question: str, topics: list) -> int:
-    """用 Flash 判断新问题与哪个话题相关：返回话题下标（0 起），都不相关返回 -1。"""
+def topic_choose(question: str, topics: list) -> str:
+    """用 Flash 判断新问题与哪个话题相关：返回话题 id（稳定标识，不随排序变化）；
+    都不相关返回 ""。返回 id 而非下标——tasks 完成后话题列表可能已重新排序，
+    用旧下标 update_topic 会写错话题。"""
     if not topics:
-        return -1
+        return ""
     lines = "\n".join(
         f"{i + 1}. {t.get('summary', '')[:60]}" for i, t in enumerate(topics[:TOPIC_MAX_ACTIVE]))
     prompt = (
@@ -2303,12 +2649,14 @@ def topic_choose(question: str, topics: list) -> int:
         text = (data.get("content") or "").strip()
         m = re.search(r"[0-9]+", text)
         if not m:
-            return -1
+            return ""
         idx = int(m.group(0)) - 1
-        return idx if 0 <= idx < len(topics) else -1
+        if 0 <= idx < len(topics):
+            return str(topics[idx].get("id", "") or "")
+        return ""
     except Exception as e:
         print(f"[bridge] 话题判定失败({type(e).__name__})，按新话题处理", flush=True)
-        return -1
+        return ""
 
 
 def topic_summarize(history: list) -> str:
@@ -2326,9 +2674,11 @@ def topic_summarize(history: list) -> str:
         return "未命名话题"
 
 
-def topics_context_text(topics: list, idx: int) -> str:
-    """生成深通道注入用的话题历史上下文。"""
-    t = topics[idx]
+def topics_context_text(topics: list, topic_id: str) -> str:
+    """生成深通道注入用的话题历史上下文（按 id 查找，找不到返回空）。"""
+    t = next((x for x in topics if str(x.get("id", "")) == topic_id), None)
+    if not t:
+        return ""
     hist = t.get("history", [])[-TOPIC_HISTORY_ROUNDS:]
     if not hist:
         return ""
@@ -2337,10 +2687,11 @@ def topics_context_text(topics: list, idx: int) -> str:
             "\n请结合以上上下文回答用户的新问题。\n")
 
 
-def update_topic(topics: list, idx: int, question: str, answer: str) -> list:
-    """把本轮问答记入话题档案（新话题则创建），返回更新后的列表。"""
+def update_topic(topics: list, topic_id: str, question: str, answer: str) -> list:
+    """把本轮问答记入话题档案（按 id 更新；topic_id 为空则创建新话题）。
+    返回更新后的列表。"""
     round_text = f"问：{question}\n答：{answer[:400]}"
-    if idx < 0:
+    if not topic_id:
         topics.append({
             "id": "t-" + uuid.uuid4().hex[:12],
             "summary": question[:60],
@@ -2349,82 +2700,145 @@ def update_topic(topics: list, idx: int, question: str, answer: str) -> list:
             "turns": 1,
         })
     else:
-        t = topics[idx]
-        t["history"] = (t.get("history", []) + [round_text])[-12:]
-        t["last_active"] = _now_iso()
-        t["turns"] = t.get("turns", 0) + 1
-        t["summary"] = topic_summarize(t["history"])
+        t = next((x for x in topics if str(x.get("id", "")) == topic_id), None)
+        if t is None:
+            # id 对应的旧话题已被清理/不存在：按新话题建（不写错别的话题）
+            topics.append({
+                "id": "t-" + uuid.uuid4().hex[:12],
+                "summary": question[:60],
+                "history": [round_text],
+                "last_active": _now_iso(),
+                "turns": 1,
+            })
+        else:
+            t["history"] = (t.get("history", []) + [round_text])[-12:]
+            t["last_active"] = _now_iso()
+            t["turns"] = t.get("turns", 0) + 1
+            t["summary"] = topic_summarize(t["history"])
     topics.sort(key=lambda t: t.get("last_active", ""), reverse=True)
     return topics
 
 
 # ---------- 待答复状态（反问后用户直接回答，无需唤醒词） ----------
-
-def is_question(text: str) -> bool:
-    """判断一段回答是否为反问（用户需要继续回答）。"""
-    s = (text or "").strip()
-    if not s:
-        return False
-    return (s.endswith("？") or s.endswith("?")
-            or "还是" in s
-            or s.endswith("吗") or s.endswith("呢") or s.endswith("么"))
+# 统一规则：只有「播报后应保持对话」（keep_open）才写 pending；
+# end 一律清理/不写。判定来源只有 intent_check_dialogue / polish_for_speech
+# 的 keep_open|end 结果（输出侧意图识别），不再用 is_question 启发式
+# （「我觉得还是这样比较好」这类含「还是」的陈述句会误判成反问）。
 
 
-def record_pending(question: str, answer: str) -> None:
-    """小爱反问后记录待答复状态：用户下一轮直接回答时提供上下文。"""
-    if not is_question(answer):
-        return
-    try:
-        with open(PENDING_FILE, "w", encoding="utf-8") as f:
-            json.dump({
+def record_pending(question: str, answer: str, action: str) -> None:
+    """按对话状态记录待答复：action == keep_open 才写；end 则清理。
+
+    question: 本轮用户问题；answer: 播报全文（反问的上下文）；action: 对话状态。
+    """
+    with _state_lock:
+        if action != "keep_open":
+            try:
+                os.remove(PENDING_FILE)
+            except OSError:
+                pass
+            return
+        try:
+            atomic_write_json(PENDING_FILE, {
                 "ts": _now_iso(),
                 "question": question,
                 "reply": answer[:800],
-            }, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
+            })
+        except OSError:
+            pass
+
+
+def clear_pending() -> None:
+    """显式清除待答复状态（对话结束/新话题开始时调用）。"""
+    with _state_lock:
+        try:
+            os.remove(PENDING_FILE)
+        except OSError:
+            pass
 
 
 def consume_pending(now_question: str) -> str:
-    """取走待答复状态：未过期则返回上下文文本（用于注入提示词），并清除。"""
-    try:
-        with open(PENDING_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        ts = datetime.datetime.fromisoformat(data.get("ts", ""))
-        if (datetime.datetime.now() - ts).total_seconds() > PENDING_TTL_SECONDS:
-            os.remove(PENDING_FILE)
+    """取走待答复状态：未过期则返回上下文文本（用于注入提示词），并清除。
+    加锁防并发：后台深任务可能同时读写 pending。"""
+    with _state_lock:
+        try:
+            with open(PENDING_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            ts = datetime.datetime.fromisoformat(data.get("ts", ""))
+            if (datetime.datetime.now() - ts).total_seconds() > PENDING_TTL_SECONDS:
+                try:
+                    os.remove(PENDING_FILE)
+                except OSError:
+                    pass
+                return ""
+            ctx = (f"【接上一轮反问】上一轮用户问「{data.get('question', '')}」，"
+                   f"你当时反问：{data.get('reply', '')}\n"
+                   f"现在用户回答：「{now_question}」——请对照你的反问理解用户的选择，"
+                   f"直接执行或回答，不要再问一遍。")
+            try:
+                os.remove(PENDING_FILE)
+            except OSError:
+                pass
+            return ctx
+        except (OSError, ValueError, KeyError):
             return ""
-        ctx = (f"【接上一轮反问】上一轮用户问「{data.get('question', '')}」，"
-               f"你当时反问：{data.get('reply', '')}\n"
-               f"现在用户回答：「{now_question}」——请对照你的反问理解用户的选择，"
-               f"直接执行或回答，不要再问一遍。")
-        os.remove(PENDING_FILE)
-        return ctx
-    except (OSError, ValueError, KeyError):
-        return ""
 
 
 # ---------- 自我进化：深通道解决后沉淀可复用流程（技能 + 工具） ----------
 
-def load_skills_text() -> str:
-    """读取音箱专用技能库内容（注入深通道提示词，让同类任务按既有流程走）。"""
+def _collect_skills(dirs: list) -> list:
+    """收集若干技能目录下的 SKILL.md 内容（目录不存在/不可读跳过）。"""
     parts: list = []
-    try:
-        for entry in sorted(os.listdir(SKILLS_DIR)):
-            path = os.path.join(SKILLS_DIR, entry, "SKILL.md")
-            if os.path.isfile(path):
-                with open(path, encoding="utf-8") as f:
-                    parts.append(f.read().strip())
-    except OSError:
-        pass
+    for base in dirs:
+        try:
+            for entry in sorted(os.listdir(base)):
+                path = os.path.join(base, entry, "SKILL.md")
+                if os.path.isfile(path):
+                    with open(path, encoding="utf-8") as f:
+                        parts.append(f.read().strip())
+        except OSError:
+            continue
+    return parts
+
+
+def load_skills_text() -> str:
+    """读取音箱专用技能库内容（注入深通道提示词，让同类任务按既有流程走）。
+
+    合并两个来源：
+    - 仓库 skills/speaker-skills/（人工维护的只读精选，不随运行改动）；
+    - 运行时 RUNTIME_SKILLS_DIR/（模型沉淀，每次重启保留，不写回公开仓库）。
+    运行时同名技能覆盖仓库同名技能（同名 = 模型对该技能的更新优先）。"""
+    repo_skills = {os.path.basename(os.path.dirname(p)): p for p in _skill_paths(SKILLS_DIR)}
+    runtime_skills = {os.path.basename(os.path.dirname(p)): p for p in _skill_paths(RUNTIME_SKILLS_DIR)}
+    runtime_skills.update(repo_skills)  # 运行时优先
+    parts: list = []
+    for _name, path in sorted(runtime_skills.items()):
+        try:
+            with open(path, encoding="utf-8") as f:
+                parts.append(f.read().strip())
+        except OSError:
+            continue
     if not parts:
         return ""
     # 控制注入长度：最多 5 个技能、每个截 800 字
     return "\n\n---\n\n".join(p[-800:] for p in parts[-5:])
 
 
+def _skill_paths(base: str) -> list:
+    """列出技能目录下所有 SKILL.md 路径。"""
+    try:
+        return [os.path.join(base, entry, "SKILL.md")
+                for entry in sorted(os.listdir(base))
+                if os.path.isdir(os.path.join(base, entry))]
+    except OSError:
+        return []
+
+
 def write_skill(block: str) -> None:
-    """把【技能】块写成 speaker-skills/<name>/SKILL.md（标准 frontmatter 格式）。"""
+    """把【技能】块写成 RUNTIME_SKILLS_DIR/<name>/SKILL.md（标准 frontmatter 格式）。
+
+    写运行时数据目录（SPEAKER_HOME/runtime/speaker-skills），绝不写公开仓库
+    的 skills/speaker-skills（防 AI 生成内容污染 git 工作区与供应链）。"""
     name = desc = ""
     for ln in block.splitlines():
         key, sep, val = ln.partition(":")
@@ -2438,11 +2852,10 @@ def write_skill(block: str) -> None:
     if not name or len(name) > 40:
         print(f"[bridge] 技能沉淀跳过（名称无效）", flush=True)
         return
-    path = os.path.join(SKILLS_DIR, name, "SKILL.md")
+    path = os.path.join(RUNTIME_SKILLS_DIR, name, "SKILL.md")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     content = f"---\nname: {name}\ndescription: {desc or name}\n---\n\n{block.strip()}\n"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+    atomic_write_text(path, content)
     print(f"[bridge] 已沉淀技能: {name}", flush=True)
 
 
@@ -2463,17 +2876,15 @@ def load_evolved_tools() -> dict:
 _evolved_tools: dict = load_evolved_tools()
 
 
-def shell_step_allowed(command: str) -> bool:
-    """只读命令白名单式校验：禁止一切修改/删除/重启/联网外传类操作。"""
-    if re.search(r"[;|&><`$]|\b(rm|mv|dd|mkfs|reboot|shutdown|poweroff|halt|kill|"
-                 r"pkill|chmod|chown|passwd|launchctl|systemctl|sudo|curl|wget|"
-                 r"ssh|scp|nc|telnet)\b", command):
-        return False
-    return bool(command.strip())
-
-
 def register_evolved_tool(spec_json: str) -> None:
-    """把【工具】块注册成快速通道可调用的工具（声明式步骤，安全校验）。"""
+    """把【工具】块注册成快速通道可调用的工具（声明式 HTTP 步骤，安全校验）。
+
+    安全边界（模型输出不可信，默认全拒）：
+    - 只接受 http 步骤，且仅 GET 方法（只读）；
+    - path 必须 /api/ 开头且总长 ≤200；
+    - 步骤数 ≤4、单步字段有限、data 字段一律拒绝（GET 无 body）；
+    - 沉淀文件写运行时目录（RUNTIME_DIR），绝不写公开仓库。
+    """
     global _tools_cache
     try:
         spec = json.loads(spec_json)
@@ -2487,25 +2898,26 @@ def register_evolved_tool(spec_json: str) -> None:
             or not desc or not isinstance(steps, list) or not steps):
         print("[bridge] 工具沉淀跳过（字段无效）", flush=True)
         return
+    if len(steps) > 4:
+        print("[bridge] 工具沉淀跳过（步骤过多）", flush=True)
+        return
     for s in steps:
-        if not isinstance(s, dict):
+        if not isinstance(s, dict) or len(s) > 2:
+            print("[bridge] 工具沉淀跳过（步骤格式非法）", flush=True)
             return
-        if "http" in s:
-            h = s["http"]
-            if not isinstance(h, dict) or not str(h.get("path", "")).startswith("/api/"):
-                print("[bridge] 工具沉淀跳过（http 步骤越界）", flush=True)
-                return
-        elif "shell" in s:
-            if not shell_step_allowed(str(s["shell"].get("command", ""))):
-                print("[bridge] 工具沉淀跳过（shell 步骤越界）", flush=True)
-                return
-        else:
-            print("[bridge] 工具沉淀跳过（步骤类型未知）", flush=True)
+        h = s.get("http")
+        if not isinstance(h, dict):
+            print("[bridge] 工具沉淀跳过（仅支持 http 步骤）", flush=True)
+            return
+        path = str(h.get("path", ""))
+        method = str(h.get("method", "GET")).upper()
+        if (not path.startswith("/api/") or len(path) > 200
+                or method != "GET" or h.get("data") is not None):
+            print("[bridge] 工具沉淀跳过（http 步骤越界：仅允许 GET /api/ 只读）", flush=True)
             return
     tools = load_evolved_tools()
     tools[name] = {"name": name, "description": desc, "steps": steps}
-    with open(EVOLVED_TOOLS_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(tools.values()), f, ensure_ascii=False, indent=2)
+    atomic_write_json(EVOLVED_TOOLS_FILE, list(tools.values()))
     _evolved_tools.clear()
     _evolved_tools.update(tools)
     _tools_cache = None  # 让工具列表缓存重建
@@ -2513,25 +2925,22 @@ def register_evolved_tool(spec_json: str) -> None:
 
 
 def run_evolved_tool(name: str) -> str:
-    """执行演化工具（声明式步骤：http→本机 HA API；shell→只读命令）。"""
+    """执行演化工具（声明式 HTTP 步骤：仅 GET /api/，只读，SSRF 由 path 白名单兜底）。"""
     spec = _evolved_tools.get(name) or {}
     parts = []
     for s in spec.get("steps", []):
-        if "http" in s:
-            h = s["http"]
-            url = HA_URL + h["path"]
-            data = json.dumps(h.get("data")).encode("utf-8") if h.get("data") else None
-            req = urllib.request.Request(
-                url, data=data, method=str(h.get("method", "GET")).upper(),
-                headers={"Authorization": f"Bearer {_load_env('HA_TOKEN')}",
-                         "Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                parts.append(resp.read().decode("utf-8", "replace")[:4000])
-        elif "shell" in s:
-            cmd = str(s["shell"].get("command", ""))
-            proc = subprocess.run(cmd, shell=True, capture_output=True,
-                                  text=True, timeout=15)
-            parts.append((proc.stdout or proc.stderr or "")[:4000])
+        h = s.get("http")
+        if not isinstance(h, dict):
+            continue
+        path = str(h.get("path", ""))
+        if not path.startswith("/api/"):
+            continue  # 已注册时校验过；防御重复检查
+        url = HA_URL + path
+        req = urllib.request.Request(
+            url, method="GET",
+            headers={"Authorization": f"Bearer {_load_env('HA_TOKEN')}"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            parts.append(resp.read().decode("utf-8", "replace")[:4000])
     return "\n".join(parts) if parts else "[工具无输出]"
 
 
@@ -2585,8 +2994,17 @@ def polish_for_speech(text: str, with_dialogue: bool = False):
     return (text, "end") if with_dialogue else text
 
 
-def _deep_push(question: str, pending_ctx: str = "") -> None:
-    """后台线程：话题判定 → 深通道处理（带话题上下文）→ 前台 Flash 润色 → 推送播报。"""
+def _deep_push(question: str, pending_ctx: str = "", turn: int | None = None) -> None:
+    """后台线程：话题判定 → 深通道处理（带话题上下文）→ 前台 Flash 润色 → 推送播报。
+
+    代际语义（turn）：任务启动时捕获自己的 turn；完成时只有 turn 仍等于
+    当前代际才执行「影响当前对话」的动作（推送播报 / 写 pending / 更新话题
+    的 last_active 排序）。旧任务（用户已说新话）：
+      - 仍写 history（事实记录，append-only）；
+      - 不推送、不写 pending（pending 只反映当前对话）；
+      - 不更新话题（避免旧结果把新话题顶到列表顶部、干扰后续 topic_choose）。
+    并发上限：深任务同时最多 3 个（防深通道资源耗尽），超出时排队等待。
+    """
     start = time.time()
     daily_cleanup()
     # 进度播报：深任务可能跑 1-2 分钟，定时让音箱说一声「还在做」，用户不必干等
@@ -2601,7 +3019,7 @@ def _deep_push(question: str, pending_ctx: str = "") -> None:
             phrase = PROGRESS_PHRASES[progress_said["n"]]
             progress_said["n"] += 1
             try:
-                push_to_migpt(phrase, origin_question=question)
+                push_to_migpt(phrase, turn=turn)  # 进度播报同样受代际保护
             except Exception:
                 pass
 
@@ -2609,55 +3027,73 @@ def _deep_push(question: str, pending_ctx: str = "") -> None:
     timer = threading.Thread(target=progress_timer, daemon=True)
     timer.start()
     try:
-        # 1. 判定话题归属：相关则续聊（注入历史上下文），无关则新开
+        # 1. 判定话题归属：相关则续聊（注入历史上下文），无关则新开。
+        #    topic_choose 返回稳定 topic id（不随列表排序变化）。
         with _topics_lock:
             topics = load_topics()
-        idx = topic_choose(question, topics)
-        context = topics_context_text(topics, idx) if idx >= 0 else ""
+        topic_id = topic_choose(question, topics)
+        context = topics_context_text(topics, topic_id) if topic_id else ""
         if pending_ctx:
             context = pending_ctx + "\n\n" + context  # 上一轮反问的上下文优先
-        if idx >= 0:
-            print(f"[bridge] 续聊话题#{idx + 1}: {topics[idx]['summary'][:30]}", flush=True)
+        if topic_id:
+            t = next((x for x in topics if str(x.get("id", "")) == topic_id), None)
+            print(f"[bridge] 续聊话题: {t['summary'][:30] if t else topic_id}", flush=True)
         # 2. 深通道执行
         answer = ask_dsh(question, fast=False, context=context)
         print(f"[bridge] 后台深化 {time.time()-start:.0f}s: {question[:40]}", flush=True)
         user_text = process_evolution(answer)
         # 2.5 播放协议：答案里若有【播放】URL，交给音箱播放并从文本中摘除
         user_text = extract_and_play(user_text)
-        # 相关性检查必须在 record_history 之前：此时历史最后一条还是深任务
-        # 的垫场语（question=原问题）；若用户已说新话，最后一条会是新问题 → 丢弃推送
-        still_relevant = (_history_last_question() == question)
+        # 代际判定（在写 history 之前）：当前是否仍是本任务的轮次
+        still_current = (turn is None or turn == current_turn())
+        # 3. 历史记录：append-only 事实记录（旧任务也写，但用 deep 标记）
         record_history(question, user_text, "deep")
-        # 3. 更新话题档案（新话题建档 / 旧话题追加+重新摘要）
-        with _topics_lock:
-            save_topics(update_topic(load_topics(), idx, question, user_text))
-        polished, dlg_action = polish_for_speech(user_text, with_dialogue=True)
-        record_pending(question, polished)  # 播报若是反问 → 记录待答复状态
-        DEEP_PREFIXES = ["我查清楚了，", "先生，我这边办好了，", "结果出来了，"]
-        if still_relevant:
-            push_to_migpt(DEEP_PREFIXES[progress_said["n"] % len(DEEP_PREFIXES)]
-                          + polished + f"<<dialogue:{dlg_action}>>")
+        if still_current:
+            # 4. 更新话题档案（新话题建档 / 旧话题按 id 追加+重新摘要）
+            with _topics_lock:
+                save_topics(update_topic(load_topics(), topic_id, question, user_text))
         else:
-            print(f"[bridge] 深任务完成但用户已说新话，丢弃过期推送: {question[:30]}",
+            print(f"[bridge] 深任务完成但已开启新对话，仅记历史不推送: {question[:30]}",
                   flush=True)
+        polished, dlg_action = polish_for_speech(user_text, with_dialogue=True)
+        # 5. 待答复状态：与流式路径同一判定来源（keep_open 才写，end 清理）；
+        #    旧任务不写 pending（pending 只反映当前对话）。
+        if still_current:
+            record_pending(question, polished, dlg_action)
+        DEEP_PREFIXES = ["我查清楚了，", "先生，我这边办好了，", "结果出来了，"]
+        if still_current:
+            push_to_migpt(DEEP_PREFIXES[progress_said["n"] % len(DEEP_PREFIXES)]
+                          + polished + f"<<dialogue:{dlg_action}>>", turn=turn)
     except subprocess.TimeoutExpired:
         print(f"[bridge] 后台深化超时({time.time()-start:.0f}s): {question[:40]}", flush=True)
-        push_to_migpt("这个任务比较复杂，一次没做完。你再说一遍，我继续处理。")
+        push_to_migpt("这个任务比较复杂，一次没做完。你再说一遍，我继续处理。", turn=turn)
     except Exception as e:
         print(f"[bridge] 后台深化失败({type(e).__name__}): {question[:40]}", flush=True)
         # 媒体类问题（点歌/白噪音等）降级到本地播放工具（网易云/web_audio_play），
         # 不依赖深通道；其他问题走大模型纯问答兜底。
         media_fallback = _media_local_fallback(question)
         if media_fallback:
-            push_to_migpt(media_fallback)
+            push_to_migpt(media_fallback, turn=turn)
         else:
             try:
                 fallback = ask_llm_plain(question, "")
-                push_to_migpt(fallback)
+                push_to_migpt(fallback, turn=turn)
             except Exception:
-                push_to_migpt("本地大脑刚刚没接上这个任务，你再说一遍试试。")
+                push_to_migpt("本地大脑刚刚没接上这个任务，你再说一遍试试。", turn=turn)
     finally:
         progress_done.set()
+        _deep_slots.release()
+
+
+# 深任务并发上限（信号量：同时最多 3 个后台深任务，超出排队）
+_deep_slots = threading.BoundedSemaphore(3)
+
+
+def _spawn_deep(question: str, pending_ctx: str = "", turn: int | None = None) -> None:
+    """带并发上限地启动后台深任务（超过 3 个时阻塞等待空位，绝不无限堆积）。"""
+    _deep_slots.acquire()
+    threading.Thread(target=_deep_push, args=(question, pending_ctx, turn),
+                     daemon=True).start()
 
 
 def _media_local_fallback(question: str) -> str:
@@ -2869,7 +3305,7 @@ def is_device_command(question: str) -> bool:
     return bool(DEVICE_COMMAND_RE.search(question))
 
 
-def answer_stream(question: str):
+def answer_stream(question: str, turn: int | None = None):
     """流式回答生成器：意图识别驱动路由 → 真流式输出，遇「深」标记转后台深通道。"""
     start = time.time()
     question = asr_repair(question)
@@ -2913,7 +3349,7 @@ def answer_stream(question: str):
     if route == "deep":
         # 复杂任务/时效资讯：直接进深通道（后台处理 + 垫场语）
         print(f"[bridge] 意图深路由: {question[:40]}", flush=True)
-        threading.Thread(target=_deep_push, args=(question, pending_ctx), daemon=True).start()
+        _spawn_deep(question, pending_ctx, turn)
         yield "这个我得联网查一查，稍等。"
         return
     if route == "doubao":
@@ -2932,13 +3368,13 @@ def answer_stream(question: str):
             else:
                 dlg_action = intent_check_dialogue(polished)
             yield f"<<dialogue:{dlg_action}>>"
-            record_pending(question, polished)
+            record_pending(question, polished, dlg_action)  # keep_open 才写，end 清理
             remember_answer(question, polished)
             print(f"[bridge] 豆包 {time.time()-start:.0f}s: {question[:40]}", flush=True)
             return
         except Exception as e:
             print(f"[bridge] 豆包失败({type(e).__name__})，降级深通道: {question[:40]}", flush=True)
-            threading.Thread(target=_deep_push, args=(question, pending_ctx), daemon=True).start()
+            _spawn_deep(question, pending_ctx, turn)
             yield "这个我得联网查一查，稍等。"
             return
     dup = None
@@ -2985,8 +3421,7 @@ def answer_stream(question: str):
                           or re.search(r"[：:，,。；;]\s*深$", marker))
             if deep_asked:
                 print(f"[bridge] 后台深化启动: {question[:40]}", flush=True)
-                threading.Thread(target=_deep_push, args=(question, pending_ctx),
-                                 daemon=True).start()
+                _spawn_deep(question, pending_ctx, turn)
                 yield "这个问题让我好好想想，想好了再告诉我。"
                 return
             if full_text:
@@ -3009,7 +3444,7 @@ def answer_stream(question: str):
                 else:
                     dlg_action = intent_check_dialogue(full_text)
                 yield f"<<dialogue:{dlg_action}>>"
-                record_pending(question, full_text)  # 反问 → 记录待答复状态
+                record_pending(question, full_text, dlg_action)  # keep_open 才写，end 清理
                 remember_answer(question, full_text)  # 重复问题去重
                 _flush_pending_play()  # 回答播报完成后放音乐（工具已找到的音频）
             print(f"[bridge] 流式 {time.time()-start:.0f}s: {question[:40]}", flush=True)
@@ -3035,13 +3470,53 @@ def answer_stream(question: str):
 
 
 class Handler(BaseHTTPRequestHandler):
+    # 只收本机（migpt）请求；请求体上限 1MB（OpenAI 兼容 JSON，足够用）
+    MAX_BODY = 1024 * 1024
+
     def _json(self, obj: dict, code: int = 200) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_body(self) -> bytes | None:
+        """读取请求体，校验 Content-Length（负数/缺失/超限拒绝）。返回 None 表示已回错误。"""
+        cl = self.headers.get("Content-Length")
+        if cl is None or not cl.strip():
+            self._json({"error": {"message": "missing content-length"}}, 411)
+            return None
+        try:
+            length = int(cl)
+        except ValueError:
+            self._json({"error": {"message": "bad content-length"}}, 400)
+            return None
+        if length < 0:
+            self._json({"error": {"message": "bad content-length"}}, 400)
+            return None
+        if length > self.MAX_BODY:
+            self._json({"error": {"message": "payload too large"}}, 413)
+            return None
+        return self.rfile.read(length)
+
+    def _check_auth(self) -> bool:
+        """本机鉴权：/v1/chat/completions 需要 Authorization: Bearer <BRIDGE_SECRET>
+        （constant-time 比较）。/v1/models 保持无鉴权——migpt 健康探测依赖它，
+        且只暴露模型 id，无敏感信息。"""
+        if self.path in ("/v1/models", "/v1/models/"):
+            return True
+        if not BRIDGE_SECRET:
+            # 未配置 secret：拒绝一切写路径（配置缺失是部署错误，不该降级开放）
+            self._json({"error": {"message": "bridge auth not configured"}}, 503)
+            return False
+        auth = self.headers.get("Authorization", "")
+        expect = "Bearer " + BRIDGE_SECRET
+        if not hmac.compare_digest(auth, expect):
+            self._json({"error": {"message": "unauthorized"}}, 401)
+            return False
+        return True
 
     def do_GET(self) -> None:
         if self.path in ("/v1/models", "/v1/models/"):
@@ -3054,9 +3529,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path not in ("/v1/chat/completions", "/v1/chat/completions/"):
             self._json({"error": {"message": "not found"}}, 404)
             return
-        length = int(self.headers.get("Content-Length", 0))
+        if not self._check_auth():
+            return
+        raw = self._read_body()
+        if raw is None:
+            return
         try:
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.loads(raw.decode("utf-8"))
             want_stream = bool(payload.get("stream"))
             messages = payload.get("messages", [])
             question = next(
@@ -3076,6 +3555,10 @@ class Handler(BaseHTTPRequestHandler):
         if not lock.acquire(timeout=45):
             self._json({"error": {"message": "busy: 上一个问题还在思考中"}}, 503)
             return
+
+        # 每轮用户请求分配进程内代际（turn）：深任务捕获自己的代际，
+        # 完成时与当前代际比对，过期结果不推送/不写 pending/不更新话题
+        turn = next_turn()
 
         if want_stream:
             # 真流式：垫场词 → Flash 逐块转发 → 结束
@@ -3102,7 +3585,7 @@ class Handler(BaseHTTPRequestHandler):
                 # 垫场词由 answer_stream 内部按路由决定（native/深路由不发垫场词）
                 answer_parts: list = []
                 try:
-                    for piece in answer_stream(question):
+                    for piece in answer_stream(question, turn):
                         if piece:
                             emit(piece)
                             answer_parts.append(piece)
@@ -3144,6 +3627,14 @@ class Handler(BaseHTTPRequestHandler):
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
+    def setup(self) -> None:
+        super().setup()
+        # 慢连接防护：单请求整体 180s 上限（正常回答流远小于此）
+        try:
+            self.connection.settimeout(180)
+        except OSError:
+            pass
+
     def log_message(self, *args) -> None:
         pass  # 安静模式
 
@@ -3152,6 +3643,18 @@ def main() -> int:
     port = PORT
     if "--port" in sys.argv:
         port = int(sys.argv[sys.argv.index("--port") + 1])
+    # 启动前配置检查（fail fast）：示例配置 / 缺桥鉴权 secret 都拒绝启动，
+    # 绝不带着「看起来正常其实没配置」的状态服务
+    if is_example():
+        print("[bridge] 使用示例配置，拒绝启动：请先复制 config/config.example.json 为"
+              " config/local.json 并在配置后台（http://127.0.0.1:8390）填写真实配置后保存。",
+              flush=True)
+        return 1
+    if not BRIDGE_SECRET:
+        print("[bridge] 未配置桥鉴权 secret，拒绝启动：请在配置后台保存一次配置"
+              "（自动生成 bridge.secret），或手动放置 config/generated/bridge-secret"
+              "（内容为 32 位以上随机 hex）。", flush=True)
+        return 1
     daily_cleanup()  # 启动时清理过期话题档案与 headless 会话文件
     _discover_devices()  # config 留空的设备实体自动从 HA 发现（日志见 [bridge] 设备自动发现）
     # 保障音箱项目文件夹有 checkout 的 node_modules（tsx 与依赖解析依赖它）；
@@ -3163,10 +3666,14 @@ def main() -> int:
         except OSError:
             pass
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.daemon_threads = True
     # 本地提醒后台线程（官方小爱已全禁，闹钟/提醒由桥侧队列 + 到点推送播报）
     threading.Thread(target=_reminder_loop, daemon=True).start()
     print(f"小爱桥 v5: http://127.0.0.1:{port}/v1（垫场+真流式+并行工具+自我进化 → 后台深通道推送）", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
     return 0
 
 

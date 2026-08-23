@@ -3,15 +3,15 @@
 
 用法:
   python3 miot_lan_probe2.py <设备did> <HA设备字典文件路径>
-  例: python3 miot_lan_probe2.py 975332202 \\
-      ~/path/to/ha/config/.storage/xiaomi_home/miot_devices/975332202_cn.dict
+  例: python3 miot_lan_probe2.py 100000001 \\
+      ~/path/to/ha/config/.storage/xiaomi_home/miot_devices/100000001_cn.dict
 """
 import json, socket, struct, time, re, sys
 from hashlib import md5 as _md5
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 
-DID = sys.argv[1] if len(sys.argv) > 1 else "2027479956"
+DID = sys.argv[1] if len(sys.argv) > 1 else "100000001"
 TOKEN_DICT_PATH = sys.argv[2] if len(sys.argv) > 2 else ""
 
 def load_token(did):

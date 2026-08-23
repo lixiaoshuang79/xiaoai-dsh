@@ -18,15 +18,21 @@
   web-audio-play.py --bvid BVxxxx                     # B站直播（跳过搜索）
   web-audio-play.py --stop                            # 停止音箱当前播放
 """
+import ipaddress
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
-from config_loader import cfg_paths, cfg_mac
+from config_loader import cfg_paths, cfg_mac, cfg_bridge_secret
+
+# 桥与 migpt 之间的本机鉴权秘密（4398 全部 POST 端点要求 Bearer）
+BRIDGE_SECRET = cfg_bridge_secret()
 
 EGO_BROWSER = cfg_paths("ego_browser") or "ego-browser"
 # 本机局域网 IP（音箱拉流转发用），从配置读取；取不到时用 127.0.0.1（本机直连场景）
@@ -34,8 +40,12 @@ MAC_IP = cfg_mac("ip") or "127.0.0.1"
 MIGPT_PLAY_URL = "http://127.0.0.1:4398/play_url"
 MIGPT_EXEC_URL = "http://127.0.0.1:4398/exec"
 RELAY_PORT = 4378  # Mac 本机流式转发端口（音箱经 http://<电脑IP>:4378 拉流，IP 从配置读取）
-RELAY_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".relay-state.json")
-# relay 目标状态文件：每次点歌重写，relay 每次请求重读——多首歌不串流
+# relay 目标状态文件：每次点歌重写，relay 每次请求重读——多首歌不串流。
+# 放运行时目录（~/.xiaogpt-speaker/runtime/），不写公开仓库工作区。
+_RELAY_STATE_DIR = cfg_paths("speaker_workspace") or os.path.expanduser("~/.xiaogpt-speaker")
+RELAY_STATE = os.path.join(_RELAY_STATE_DIR, "runtime", "relay-state.json")
+# relay 随机访问令牌：与状态文件一起生成，请求路径必须带 token（防局域网任意设备旁听）
+RELAY_TOKEN = secrets.token_urlsafe(24)
 
 # 平台注册表：key=平台名，value=ego-browser 一侧的解析逻辑（Node 脚本片段）。
 # 每个适配器最终 cliLog 一个 JSON：{title, url, duration?, source}，
@@ -162,20 +172,73 @@ PLATFORM_ADAPTERS = {
 # 公共头：每个适配器执行前先选中/创建 task space（cdp 依赖它）
 ADAPTER_HEADER = "const task = await useOrCreateTaskSpace('web-audio-play')\n"
 
+def _relay_url_safe(url: str) -> bool:
+    """Mac 侧 relay 拉取目标校验（拒绝面最大：Mac 有本机网络特权与凭据，
+    可达 127.0.0.1:8123 HA、内网设备、云 metadata——全部拒绝）。
+
+    只放行公网 http/https（无 userinfo、无控制字符、非 IP 或 IP 为公网）。
+    私网 LAN（192.168/16 等）也拒绝——relay 的语义是「代理公网音频流」。
+    """
+    if not url or not isinstance(url, str):
+        return False
+    if len(url) > 2048:
+        return False
+    if re.search(r"[\x00-\x1f\x7f\s]", url):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if parsed.username or parsed.password:
+        return False
+    host = parsed.hostname or ""
+    if not host:
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+        if addr.is_global is False:
+            return False  # loopback/private/link-local/reserved/unspecified 全拒
+        return True
+    except ValueError:
+        pass  # 域名：无法预先解析（DNS rebinding 风险有限，relay 只读拉流）
+    return True
+
+
+def _relay_token_ok(path: str) -> bool:
+    """relay 访问路径校验：/ping 直返；/s/<token> 必须匹配当前令牌（防局域网旁听）。"""
+    if path == "/ping":
+        return True
+    return path == "/s/" + RELAY_TOKEN or path.startswith("/s/" + RELAY_TOKEN + "?")
+
+
 RELAY_CODE = r'''
 import http.server
+import ipaddress
 import json
+import re
 import shutil
 import ssl
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 # 目标 URL/Referer 存状态文件，每次请求重读：多次点歌时永远拉最新一首的流
 STATE = sys.argv[3]
-# 部分平台 CDN（如 B 站 mcdn）证书链不完整，Python 默认校验必失败——只拉音频流，跳过校验
-CTX = ssl._create_unverified_context()
+TOKEN = sys.argv[4] if len(sys.argv) > 4 else ""
+# 部分平台 CDN（如 B 站 mcdn）证书链不完整，Python 默认校验必失败——只拉音频流。
+# 仅对 B 站 mcdn 域跳过校验（_need_unverified），其余目标走默认验证（防中间人）。
+def _need_unverified(url):
+    try:
+        host = urllib.parse.urlsplit(url).hostname or ""
+    except ValueError:
+        return False
+    h = host.lower()
+    return ("hdslb.com" in h or "bilivideo.cn" in h or "bilivideo.com" in h
+            or "bilibili" in h)
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
 LAST = [time.time()]
@@ -189,6 +252,32 @@ def current():
     except Exception:
         return None, "https://www.bilibili.com/"
 
+def relay_url_safe(url):
+    if not url or not isinstance(url, str):
+        return False
+    if len(url) > 2048:
+        return False
+    if re.search(r"[\x00-\x1f\x7f\s]", url):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if parsed.username or parsed.password:
+        return False
+    host = parsed.hostname or ""
+    if not host:
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+        if addr.is_global is False:
+            return False
+        return True
+    except ValueError:
+        return True  # 域名：relay 只读拉流，DNS rebinding 影响有限
+
 class H(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     def do_GET(self):
@@ -201,16 +290,22 @@ class H(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        # 令牌校验：只有持有当前令牌的请求能拿流（音箱从状态文件读带 token 的 URL）
+        if TOKEN and self.path != "/s/" + TOKEN and not self.path.startswith("/s/" + TOKEN + "?"):
+            self.send_response(403)
+            self.end_headers()
+            return
         try:
             target, ref = current()
-            if not target:
-                raise Exception("no target")
+            if not target or not relay_url_safe(target):
+                raise Exception("bad target")
+            ctx = ssl._create_unverified_context() if _need_unverified(target) else None
             req = urllib.request.Request(target, headers={
                 "User-Agent": UA, "Referer": ref})
             rng = self.headers.get("Range")
             if rng:
                 req.add_header("Range", rng)
-            with urllib.request.urlopen(req, timeout=60, context=CTX) as up:
+            with urllib.request.urlopen(req, timeout=60, context=ctx) as up:
                 self.send_response(up.status)
                 for k, v in up.headers.items():
                     if k.lower() in ("content-type", "content-length",
@@ -218,11 +313,12 @@ class H(http.server.BaseHTTPRequestHandler):
                         self.send_header(k, v)
                 self.end_headers()
                 shutil.copyfileobj(up, self.wfile, 64 * 1024)  # 流式转发，零落盘
-        except Exception as e:
+        except Exception:
+            # 502 不回显上游异常详情（可能含 URL/原因，避免泄露给局域网客户端）
             try:
                 self.send_response(502)
                 self.end_headers()
-                self.wfile.write(str(e).encode())
+                self.wfile.write(b"proxy error")
             except Exception:
                 pass
     def log_message(self, *a):
@@ -266,29 +362,41 @@ def _start_relay() -> None:
     """起流式转发进程（带 Referer/UA 转发平台 CDN 流，零落盘零转码）。"""
     code = RELAY_CODE.replace("{port}", str(RELAY_PORT))
     subprocess.Popen(
-        [sys.executable, "-c", code, "-", "-", RELAY_STATE],
+        [sys.executable, "-c", code, "-", "-", RELAY_STATE, RELAY_TOKEN],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True)  # 脱离父进程，播放期间持续服务
 
 
 def _ensure_relay(url: str, referer: str) -> None:
-    """更新 relay 目标并确保进程在跑（每次点歌重写目标文件，防多首歌串流）。"""
+    """更新 relay 目标并确保进程在跑（每次点歌重写目标文件，防多首歌串流）。
+    URL 必须通过 Mac 侧校验（拒绝内网/本机地址——relay 有 Mac 网络特权，
+    是 SSRF 高危面；只代理公网音频流）。校验失败抛 ValueError（调用方如实报错）。"""
+    if not _relay_url_safe(url):
+        raise ValueError("目标 URL 未通过安全检查（仅允许公网音频流）")
+    os.makedirs(os.path.dirname(RELAY_STATE), exist_ok=True)
     with open(RELAY_STATE, "w") as f:
         json.dump({"url": url, "referer": referer}, f)
     if not _relay_alive():
         _start_relay()
 
 
-def _shell(cmd: str) -> str:
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=180)
-    # ego-browser 的 cliLog 输出在 stderr，日志也混在里面——合并返回
+def _run_proc(args: list, input_text: str = "") -> str:
+    """免 shell 执行：args 直传（无 shell 拼接，杜绝命令注入）；
+    ego-browser 脚本经 stdin 传入（替代 heredoc 拼接）。"""
+    try:
+        r = subprocess.run(args, input=input_text, capture_output=True,
+                           text=True, timeout=180)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return f"<ERR>_ERR 执行失败: {e}"
     return ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
 
 
 def _migpt_post(url: str, payload: dict) -> str:
     req = urllib.request.Request(
         url, json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"}, method="POST")
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {BRIDGE_SECRET}"},
+        method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return resp.read().decode("utf-8", errors="ignore")
@@ -306,10 +414,11 @@ def _run_adapter(adapter: str, keyword: str, index: int, quality: str,
               .replace("BVID", json.dumps(bvid))
               .replace("TARGET_URL", json.dumps(url))
               .replace("LIST_ONLY", "true" if list_only else "false"))
-    if not _shell("pgrep -f 'ego lite' >/dev/null && echo RUNNING"):
-        _shell("open -a 'ego lite'")
+    # ego lite 未启动时先拉起（免 shell）
+    if not _run_proc(["pgrep", "-f", "ego lite"]):
+        _run_proc(["open", "-a", "ego lite"])
         time.sleep(6)
-    return _shell(f"{EGO_BROWSER} nodejs <<'EOF'\n{script}\nEOF")
+    return _run_proc([EGO_BROWSER, "nodejs"], input_text=script)
 
 
 def _extract_result(out: str) -> dict:
@@ -389,8 +498,13 @@ def main() -> None:
             if res.get("source") == "bilibili" or not _url_reachable(play_url):
                 print("[web-audio] 平台有防盗链/直链不稳，Mac 流式转发（零落盘）")
                 ref = "https://www.bilibili.com/" if res.get("source") == "bilibili" else "https://www.douyin.com/"
-                _ensure_relay(play_url, ref)
-                play_url = f"http://{MAC_IP}:{RELAY_PORT}/stream"
+                try:
+                    _ensure_relay(play_url, ref)
+                except ValueError as e:
+                    print(f"[web-audio] {e}", file=sys.stderr)
+                    sys.exit(1)
+                # 带随机令牌的流地址（防局域网任意设备旁听）
+                play_url = f"http://{MAC_IP}:{RELAY_PORT}/s/{RELAY_TOKEN}"
             else:
                 print("[web-audio] 直链可行，音箱直接拉流")
             if no_play:
