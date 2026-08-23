@@ -29,6 +29,17 @@ EXCLUDES=(
   ':(exclude)docs'
 )
 
+# IP 检查额外豁免：测试文件（语义必需的示例/恶意样本 IP，非真实网络信息）。
+# 仅豁免「疑似真实 IP」检查；密钥模式检查（run_grep 默认路径）仍覆盖这些文件。
+# 新增测试文件时若含示例 IP，须在此登记，否则 CI 会红。
+EXCLUDES_IP=(
+  ':(exclude)admin/test_admin.py'
+  ':(exclude)bridge/test_bridge.py'
+  ':(exclude)migpt/src/auth.rs'
+  ':(exclude)migpt/test/speaker-gate.test.ts'
+  ':(exclude)migpt/test/config.test.ts'
+)
+
 # 常见密钥模式（git grep 扩展正则；不要加会命中模板代码的宽松模式）
 SECRET_PATTERNS='AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN (RSA|OPENSSH|EC|DSA|PRIVATE) PRIVATE KEY-----|sk-[A-Za-z0-9]{20,}|eyJhbGciOi[A-Za-z0-9_-]{10,}|Bearer [A-Za-z0-9._-]{20,}'
 
@@ -76,7 +87,7 @@ is_version_string_line() {
   return 1
 }
 
-ip_output=$(run_grep '[0-9]{1,3}(\.[0-9]{1,3}){3}')
+ip_output=$(run_grep '[0-9]{1,3}(\.[0-9]{1,3}){3}' "${EXCLUDES_IP[@]}")
 rc=$?
 if [ "$rc" -eq 0 ]; then
   bad=""

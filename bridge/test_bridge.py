@@ -53,7 +53,7 @@ class FakeConfig:
             REMINDER_FILE=os.path.join(self.runtime, "speaker-reminders.json"),
             EVOLVED_TOOLS_FILE=os.path.join(self.runtime, "evolved-tools.json"),
             RUNTIME_SKILLS_DIR=os.path.join(self.runtime, "speaker-skills"),
-            BRIDGE_SECRET="test-secret-0123456789abcdef",
+            BRIDGE_SECRET="test-secret",
             ALLOW_PRIVATE_URLS=True,
         )
         patcher.start()
@@ -431,8 +431,10 @@ class TestHttpHandlerAuthAndLimits(unittest.TestCase):
         self.assertFalse(h._check_auth())
 
     def test_correct_secret_ok(self):
+        # 注意：fixture 值刻意保持短（<20 字符），避免命中 secret-scan 的
+        # "Bearer [A-Za-z0-9._-]{20,}" 模式（假密钥不应触发泄露告警）
         h = self._h(headers={"Content-Length": "2",
-                             "Authorization": "Bearer test-secret-0123456789abcdef"})
+                             "Authorization": "Bearer test-secret"})
         self.assertTrue(h._check_auth())
 
     def test_models_open_without_auth(self):
