@@ -1,5 +1,6 @@
 import { sleep } from "@mi-gpt/utils";
 import { readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { OpenXiaoAIConfig } from "./migpt/xiaoai.js";
 import {
@@ -25,6 +26,14 @@ interface RepoConfig {
     fast_model?: string;
     system_prompt?: string;
   };
+  /**
+   * 桥鉴权 secret（32 位 hex，由 admin 后台生成/保存）：
+   * migpt 的 4398 POST 端点要求桥携带 Authorization: Bearer <secret>；
+   * migpt 探测 8322 /v1/models 时也带同样的 Bearer。
+   */
+  bridge?: {
+    secret?: string;
+  };
 }
 
 function loadRepoConfig(): RepoConfig {
@@ -41,6 +50,40 @@ function loadRepoConfig(): RepoConfig {
 }
 
 const repoConfig = loadRepoConfig();
+
+/** 归一化 secret：非字符串/空白 → 空串（测试可直测）。 */
+export function normalizeBridgeSecret(v: unknown): string {
+  if (typeof v !== "string") return "";
+  return v.trim();
+}
+
+/**
+ * 读取桥鉴权 secret：优先 config/local.json 的 bridge.secret，
+ * 其次 config/generated/bridge-secret 文件内容（trim）；
+ * 都没有则记为 "" 并警告（本机桥鉴权不可用）。
+ */
+function loadBridgeSecret(): string {
+  const fromJson = normalizeBridgeSecret(repoConfig.bridge?.secret);
+  if (fromJson) return fromJson;
+  try {
+    const file = readFileSync(
+      fileURLToPath(new URL("../config/generated/bridge-secret", import.meta.url)),
+      "utf-8",
+    ).trim();
+    if (file) return file;
+  } catch {
+    /* 文件不存在 */
+  }
+  console.error("⚠️ 未配置 bridge.secret，本机桥鉴权不可用");
+  return "";
+}
+
+const bridgeSecret = loadBridgeSecret();
+
+/** 当前桥鉴权 secret（4398 端点鉴权用；为空时所有 POST 一律 401，不留公开 fallback）。 */
+export function getBridgeSecret(): string {
+  return bridgeSecret;
+}
 
 /**
  * 大模型直连兜底：当本地桥（127.0.0.1:8322，xiaogpt-bridge）挂了、或者本机 DSH
@@ -76,45 +119,54 @@ const LLM_FALLBACK_SYSTEM =
 
 /**
  * 直接调用户配置的大模型（OpenAI 兼容，原生 fetch，无 SDK 依赖）。
- * 非流式，返回完整回答文本。
+ * 非流式，返回完整回答文本。25s 超时（AbortController，成功/失败路径都清理 timer）。
  */
 async function askLlmDirect(question: string): Promise<string> {
   const apiKey = loadLlmKey();
   if (!apiKey) {
     throw new Error("大模型 API Key 缺失");
   }
-  const resp = await fetch(`${LLM_BASE}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: LLM_MODEL,
-      messages: [
-        { role: "system", content: LLM_FALLBACK_SYSTEM },
-        { role: "user", content: question },
-      ] satisfies LlmMessage[],
-      thinking: { type: "disabled" },
-    }),
-  });
-  if (!resp.ok) {
-    throw new Error(`大模型 HTTP ${resp.status}`);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 25_000);
+  try {
+    const resp = await fetch(`${LLM_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: LLM_MODEL,
+        messages: [
+          { role: "system", content: LLM_FALLBACK_SYSTEM },
+          { role: "user", content: question },
+        ] satisfies LlmMessage[],
+        thinking: { type: "disabled" },
+      }),
+      signal: ctrl.signal,
+    });
+    if (!resp.ok) {
+      throw new Error(`大模型 HTTP ${resp.status}`);
+    }
+    const data = (await resp.json()) as {
+      choices?: { message?: { content?: string } }[];
+      error?: unknown;
+    };
+    if (data.error) {
+      throw new Error(`大模型错误: ${JSON.stringify(data.error)}`);
+    }
+    return data.choices?.[0]?.message?.content?.trim() || "";
+  } finally {
+    clearTimeout(timer);
   }
-  const data = (await resp.json()) as {
-    choices?: { message?: { content?: string } }[];
-    error?: unknown;
-  };
-  if (data.error) {
-    throw new Error(`大模型错误: ${JSON.stringify(data.error)}`);
-  }
-  return data.choices?.[0]?.message?.content?.trim() || "";
 }
 
 /**
  * 探测本地桥（127.0.0.1:8322）健康状态。
  * 桥挂了时避免每次唤醒都等超时：健康结果缓存 10 秒，失败结果缓存 3 秒
  * （桥恢复后很快自动切回，不重启 migpt 也能恢复）。
+ * 探测带 Authorization: Bearer <bridge.secret>——桥若启用了鉴权而本机
+ * 未配置 secret，会收到 401 并视为不健康（日志提示配置缺失）。
  */
 let _bridgeCache = { ok: true, ts: 0 };
 async function isBridgeHealthy(): Promise<boolean> {
@@ -123,16 +175,23 @@ async function isBridgeHealthy(): Promise<boolean> {
   if (now - _bridgeCache.ts < ttl) {
     return _bridgeCache.ok;
   }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 1200);
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 1200);
     const resp = await fetch("http://127.0.0.1:8322/v1/models", {
       signal: ctrl.signal,
+      headers: { Authorization: `Bearer ${bridgeSecret}` },
     });
-    clearTimeout(timer);
     _bridgeCache = { ok: resp.ok, ts: now };
+    if (!resp.ok && resp.status === 401 && !bridgeSecret) {
+      console.error(
+        "⚠️ 本地桥要求鉴权但未配置 bridge.secret，视为不健康（请在 config/local.json 配置 bridge.secret）",
+      );
+    }
   } catch {
     _bridgeCache = { ok: false, ts: now };
+  } finally {
+    clearTimeout(timer); // 成功/失败路径都清理
   }
   return _bridgeCache.ok;
 }
@@ -153,13 +212,20 @@ async function isBridgeHealthy(): Promise<boolean> {
  * migpt 本地不再维护白名单。
  */
 
+/**
+ * 引擎 OpenAI 配置：apiKey 用桥鉴权 secret（engine 的请求会带
+ * Authorization: Bearer <secret> 到 8322）。secret 为空时用随机临时值
+ * （每次进程启动随机，不留公开固定 fallback key；日志已有配置缺失警告）。
+ */
+const _randomKey = `local-${randomBytes(16).toString("hex")}`;
+
 export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
   openai: {
     /**
      * 本地大脑桥（xiaogpt-bridge，OpenAI 兼容）
      */
     baseURL: "http://127.0.0.1:8322/v1",
-    apiKey: "dsh-local",
+    apiKey: bridgeSecret || _randomKey,
     model: "dsh-local",
   },
   prompt: {
@@ -196,7 +262,7 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
     if (["闭嘴", "别说了", "停下", "别念了", "安静"].includes(text)) {
       await engine.speaker.setPlaying(false);
       flushPlayQueue(); // 清空排队中的播报（深通道推送等一律作废）
-      stopMusic(); // 连正在播/排队中的音乐一起停（musicEpoch+1 作废队列 + 杀 miplayer）
+      void stopMusic(); // 连正在播/排队中的音乐一起停（内部吞错，不会 unhandled rejection）
       try {
         await engine.speaker.runShell(
           "/data/open-xiaoai/restart-aivs.sh /data/open-xiaoai/hook_final.so",
@@ -254,6 +320,9 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
     //    <<dialogue:keep_open|end>> = 播报完是否静默唤醒保持麦克风
     //    播报走播报门（speaker-gate）：全局串行互斥 + 对话代际过期丢弃 +
     //    流式回答屏障（chunk 连续播，深通道推送等回答外播报不插队）。
+    //    整个流式播报循环包在 try/finally 里：无论正常结束 / 用户插话 break /
+    //    任意异常（stream.read 抛错等），finally 都 endAnswer() 复位 answerActive，
+    //    后续 push/music/wakeup 不会被永久挂起（P1-9）。
     const epoch = newDialog();
     beginAnswer(); // 流式回答开始：回答外播报（推送/唤醒/音乐）挂起
     // 通知音箱端钩子「我们正在作答」：官方在此期间的 Speak（抢答/补发）会被
@@ -261,38 +330,55 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
     engine.speaker
       .runShell("date +%s > /tmp/xdf_our_pending", { timeout: 5000 })
       .catch(() => {});
-    let fullText = "";
+    let pendingText = ""; // 累积缓冲：控制标记可能被流式输出劈成多块
     let dialogueAction = ""; // keep_open | end | ""（默认 end）
     let nativePass = false;
-    while (true) {
-      const { next, noMore } = reply.stream.read();
-      if (!next && noMore) {
-        break;
-      }
-      if (next) {
-        // 用户插话打断：停止播放本次回答，作废排队中的播报段
-        if (engine.lastMsg !== msg) {
-          reply.stream.cancel();
-          newDialog(); // 代际 +1：旧播报段全作废
+    try {
+      while (true) {
+        const { next, noMore } = reply.stream.read();
+        if (next) {
+          // 用户插话打断：停止播放本次回答，作废排队中的播报段
+          if (engine.lastMsg !== msg) {
+            reply.stream.cancel();
+            newDialog(); // 代际 +1：旧播报段全作废
+            break;
+          }
+          // 控制标记从累积缓冲提取（不逐 chunk 猜），剔除后不播报
+          pendingText += next;
+          const m = extractBridgeMarkers(pendingText, false);
+          if (m.dialogueAction) dialogueAction = m.dialogueAction;
+          if (m.nativePass) nativePass = true;
+          pendingText = m.keep;
+          if (m.playable) {
+            console.log(`🔊 ${m.playable}`);
+            try {
+              await enqueueChunk(m.playable, epoch); // chunk 连续播，不经回答屏障
+            } catch (err) {
+              // chunk 播报失败不中断整个回答循环（队列已恢复，这里只记录）
+              console.error("🔇 chunk 播报失败（跳过，继续回答循环）:", err);
+            }
+          }
+        }
+        if (!next && noMore) {
           break;
         }
-        if (next.includes("<<native_passthrough>>")) {
-          nativePass = true;
-          console.log("🏠 桥意图判定：放行原生应答");
-          continue; // 控制标记不播报
-        }
-        const marker = next.match(/<<dialogue:(keep_open|end)>>/);
-        if (marker) {
-          dialogueAction = marker[1] ?? "";
-          continue; // 控制标记不播报
-        }
-        fullText += next;
-        console.log(`🔊 ${next}`);
-        await enqueueChunk(next, epoch); // chunk 连续播，不经回答屏障
+        await sleep(100);
       }
-      await sleep(100);
+      // 流结束：清空残余（残缺控制标记在此丢弃，不播报）
+      const m = extractBridgeMarkers(pendingText, true);
+      if (m.dialogueAction) dialogueAction = m.dialogueAction;
+      if (m.nativePass) nativePass = true;
+      if (m.playable) {
+        console.log(`🔊 ${m.playable}`);
+        try {
+          await enqueueChunk(m.playable, epoch);
+        } catch (err) {
+          console.error("🔇 chunk 播报失败（跳过）:", err);
+        }
+      }
+    } finally {
+      endAnswer(); // 幂等复位：异常/插话/正常结束都恢复 answerActive
     }
-    endAnswer(); // 流式回答结束：挂起的推送/唤醒/音乐按顺序继续
     if (nativePass) {
       return { handled: true }; // 放行原生：官方小爱自己应答，migpt 不播
     }
@@ -306,3 +392,60 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
     return { handled: true };
   },
 };
+
+/**
+ * 桥下发控制标记（流式版提取器）：标记可能被 LLM 流式输出劈成多块——
+ * 完整标记被剥离（不播报），疑似「标记前缀」的尾部留到 keep 等下一 chunk
+ * 确认；atEnd=true（流结束）时残缺尾部按控制杂质丢弃（不播报）。
+ */
+const DIALOGUE_MARKER_RE = /<<dialogue:(keep_open|end)>>/g;
+const NATIVE_PASSTHROUGH_MARKER = "<<native_passthrough>>";
+const BRIDGE_MARKERS = [
+  "<<dialogue:keep_open>>",
+  "<<dialogue:end>>",
+  "<<native_passthrough>>",
+];
+
+export type BridgeMarkers = {
+  /** 可安全播报的文本（已剥离完整标记；不含可能被劈开的标记尾部） */
+  playable: string;
+  /** 需要留到下一 chunk 的残缺标记尾部 */
+  keep: string;
+  dialogueAction: string;
+  nativePass: boolean;
+};
+
+export function extractBridgeMarkers(buf: string, atEnd = false): BridgeMarkers {
+  let b = buf;
+  let dialogueAction = "";
+  let nativePass = false;
+  b = b.replace(DIALOGUE_MARKER_RE, (_m, action: string | undefined) => {
+    dialogueAction = action ?? "";
+    return "";
+  });
+  if (b.includes(NATIVE_PASSTHROUGH_MARKER)) {
+    nativePass = true;
+    b = b.split(NATIVE_PASSTHROUGH_MARKER).join("");
+  }
+  const lastOpen = b.lastIndexOf("<<");
+  if (lastOpen !== -1) {
+    const tail = b.slice(lastOpen);
+    if (atEnd) {
+      // 流结束：残缺尾部若可能是未完成的标记 → 按控制杂质丢弃；否则是正文
+      const couldBeMarker = BRIDGE_MARKERS.some((m) => m.startsWith(tail));
+      return {
+        playable: couldBeMarker ? b.slice(0, lastOpen) : b,
+        keep: "",
+        dialogueAction,
+        nativePass,
+      };
+    }
+    const isPartial = BRIDGE_MARKERS.some(
+      (m) => m.startsWith(tail) && tail.length < m.length,
+    );
+    if (isPartial) {
+      return { playable: b.slice(0, lastOpen), keep: tail, dialogueAction, nativePass };
+    }
+  }
+  return { playable: b, keep: "", dialogueAction, nativePass };
+}

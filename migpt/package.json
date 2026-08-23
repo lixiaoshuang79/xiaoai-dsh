@@ -7,7 +7,9 @@
   "scripts": {
     "build": "cargo-cp-artifact -ac open_xiaoai_server migpt/open-xiaoai.node -- cargo build --release --message-format=json-render-diagnostics",
     "start": "tsx migpt/index.ts",
-    "dev": "pnpm build && pnpm start"
+    "dev": "pnpm build && pnpm start",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@mi-gpt/engine": "1.2.1",
@@ -23,6 +25,6 @@
   },
   "packageManager": "pnpm@9.15.9",
   "engines": {
-    "node": ">=16"
+    "node": ">=20"
   }
 }

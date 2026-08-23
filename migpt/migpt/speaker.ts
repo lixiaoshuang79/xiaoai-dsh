@@ -1,5 +1,6 @@
 import { jsonEncode } from "@mi-gpt/utils/parse";
 import { RustServer } from "./open-xiaoai.js";
+import { shq } from "./speaker-gate.js";
 import type { ISpeaker } from "@mi-gpt/engine/base";
 
 export interface CommandResult {
@@ -70,8 +71,8 @@ class SpeakerManager implements ISpeaker {
     if (blocking) {
       const res = await this.runShell(
         url
-          ? `miplayer -f '${url}'`
-          : `date +%s > /tmp/xdf_our_pending; /usr/sbin/tts_play.sh '${text || "你好"}'`,
+          ? `miplayer -f ${shq(url)}`
+          : `date +%s > /tmp/xdf_our_pending; /usr/sbin/tts_play.sh ${shq(text || "你好")}`,
         { timeout }
       );
       return res?.exit_code === 0;
@@ -79,14 +80,14 @@ class SpeakerManager implements ISpeaker {
 
     const res = await this.runShell(
       url
-        ? `ubus call mediaplayer player_play_url '${jsonEncode({
+        ? `ubus call mediaplayer player_play_url ${shq(jsonEncode({
             url: url,
             type: 1,
-          })}'`
-        : `date +%s > /tmp/xdf_our_pending; ubus call mibrain text_to_speech '${jsonEncode({
+          }))}`
+        : `date +%s > /tmp/xdf_our_pending; ubus call mibrain text_to_speech ${shq(jsonEncode({
             text: text || "你好",
             save: 0,
-          })}'`,
+          }))}`,
       { timeout }
     );
     return res?.stdout.includes('"code": 0') ?? false;
@@ -132,11 +133,11 @@ class SpeakerManager implements ISpeaker {
   ) {
     const { silent = false } = options ?? {};
     const res = await this.runShell(
-      `ubus call mibrain ai_service '${jsonEncode({
+      `ubus call mibrain ai_service ${shq(jsonEncode({
         tts: silent ? undefined : 1,
         nlp: 1,
         nlp_text: text,
-      })}'`
+      }))}`
     );
     return res?.stdout.includes('"code": 0');
   }

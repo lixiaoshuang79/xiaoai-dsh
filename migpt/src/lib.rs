@@ -6,13 +6,14 @@ use runtime::runtime;
 use serde_json::json;
 use server::AppServer;
 
+mod auth;
 mod node;
 mod runtime;
 mod server;
 
 #[neon::export]
-async fn start() -> () {
-    let _ = AppServer::run().await;
+async fn start() -> Result<(), String> {
+    AppServer::run().await
 }
 
 #[neon::export]
@@ -26,7 +27,12 @@ async fn run_shell(script: String, timeout_millis: f64) -> String {
         .await;
     match res {
         Err(e) => format!("run_shell error: {}", e),
-        Ok(res) => serde_json::to_string(&res.data.unwrap()).unwrap(),
+        Ok(res) => match res.data {
+            Some(data) => serde_json::to_string(&data).unwrap_or_else(|e| {
+                format!("run_shell error: 序列化响应失败: {}", e)
+            }),
+            None => "run_shell error: 响应缺少 data".to_string(),
+        },
     }
 }
 
