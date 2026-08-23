@@ -32,7 +32,16 @@
     "ac_temperature": "number.your_ac_temperature_entity",
     "ac_turn_on": "button.your_ac_turn_on_entity",
     "vacuum_entity": "vacuum.your_vacuum_entity",
-    "vacuum_mode_entity": "select.your_vacuum_cleaning_mode_entity"
+    "vacuum_mode_entity": "select.your_vacuum_cleaning_mode_entity",
+    "ac_turn_off": "button.your_ac_turn_off_entity",
+    "ac_mode": "select.your_ac_mode_entity",
+    "ac_fan_up": "button.your_ac_fan_speed_up_entity",
+    "ac_fan_down": "button.your_ac_fan_speed_down_entity",
+    "fan_entity": "fan.your_fan_entity",
+    "fan_delay_entity": "number.your_fan_off_delay_entity",
+    "fan_angle_entity": "select.your_fan_swing_angle_entity",
+    "camera1_on": "switch.your_camera1_power_entity",
+    "camera2_on": "switch.your_camera2_power_entity"
   },
   "paths": {
     "node": "/usr/local/bin/node",

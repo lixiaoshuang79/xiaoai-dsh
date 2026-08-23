@@ -69,11 +69,23 @@ MAIN_LIGHT_ENTITY = cfg_devices("main_light") or ""
 AMBIENT_LIGHT_ENTITY = cfg_devices("ambient_light") or ""
 AC_TEMP_ENTITY = cfg_devices("ac_temperature") or ""
 AC_TURN_ON_ENTITY = cfg_devices("ac_turn_on") or ""
+AC_TURN_OFF_ENTITY = cfg_devices("ac_turn_off") or ""
+AC_MODE_ENTITY = cfg_devices("ac_mode") or ""
+AC_FAN_UP_ENTITY = cfg_devices("ac_fan_up") or ""
+AC_FAN_DOWN_ENTITY = cfg_devices("ac_fan_down") or ""
 
 # ---------- 扫地机器人（石头 G10S 2）确定性短路 ----------
 
 VACUUM_ENTITY = cfg_devices("vacuum_entity") or ""
 VACUUM_MODE_ENTITY = cfg_devices("vacuum_mode_entity") or ""
+
+# ---------- 塔扇 / 摄像头确定性短路 ----------
+
+FAN_ENTITY = cfg_devices("fan_entity") or ""
+FAN_DELAY_ENTITY = cfg_devices("fan_delay_entity") or ""
+FAN_ANGLE_ENTITY = cfg_devices("fan_angle_entity") or ""
+CAM1_ON_ENTITY = cfg_devices("camera1_on") or ""
+CAM2_ON_ENTITY = cfg_devices("camera2_on") or ""
 
 
 def _ha_state(entity_id: str) -> dict:
@@ -97,6 +109,8 @@ def _vacuum_shortcut(question: str) -> str | None:
         return None  # 无机器人语境（“拖地”这种模糊词不触发）
     if re.search(r"客厅|卧室|厨房|卫生间|厕所|书房|阳台|餐厅|饭厅|房间|次卧|主卧", question):
         return None  # 按房间清扫：HA 未暴露房间 ID，短路启动会误清全屋，走模型如实处理
+    if re.search(r"吗|有没有|是不是|还在|在不在|状态|电量|多少|几[个下]|没电|滤网|记录|面积|多久", question):
+        return None  # 查询类（还在扫吗/电量多少…）走模型读实体，绝不触发启动
     if re.search(r"暂停|停一下|歇一下", question):
         _ha_service("vacuum", "pause", {"entity_id": VACUUM_ENTITY})
         print("[bridge] 扫地机短路: 暂停", flush=True)
@@ -123,7 +137,9 @@ def _vacuum_shortcut(question: str) -> str | None:
         _ha_service("vacuum", "start", {"entity_id": VACUUM_ENTITY})
         print(f"[bridge] 扫地机短路: 模式{mode} 启动", flush=True)
         return f"开始{what}了，先生。"
-    if re.search(r"扫地|打扫|清扫|大扫除|扫一下|扫扫|干活", question):
+    # 裸启动：剥离设备名后再看有没有动作词（防「扫地机器人」三字自带「扫地」误触发）
+    q_act = re.sub(r"扫地机器?人?|石头", "", question)
+    if re.search(r"扫地|打扫|清扫|大扫除|扫一下|扫扫|扫个|扫一会|干活|启动|开始", q_act):
         # 没指明模式：按当前模式直接启动，并如实播报
         try:
             st = _ha_state(VACUUM_MODE_ENTITY)
@@ -362,25 +378,194 @@ SPEAKER_PLAYER = cfg_devices("speaker_volume") or ""  # 正在使用的音箱
 SPEAKER_PLAYER_2 = cfg_devices("speaker_volume_2") or ""  # 另一台音箱（可选）
 
 
-def _ac_temp_shortcut(question: str) -> str | None:
-    """空调调温确定性短路：「空调+数字温度」直接 HA 设值，一次完成。
-    红外空调无状态回读，绝不反复查询验证；带「开」字时先发开机码。
-    不匹配或温度超范围返回 None（走模型工具链）。"""
+def _ac_shortcut(question: str) -> str | None:
+    """空调确定性短路（红外无状态回读，绝不查状态验证）：
+    温度（16-30 度）、模式（制冷/制热/除湿/送风/自动）、风速±、开关机。
+    模式/温度组合（制冷26度）一次完成；带「开」字先发开机码（离散开机码幂等）。"""
+    if not (AC_TEMP_ENTITY and AC_TURN_ON_ENTITY):
+        return None  # 未配置
     if "空调" not in question:
         return None
-    m = re.search(r"(\d{1,2})\s*度", question)
+    if re.search(r"吗|有没有|是不是|多少度|几度|状态", question):
+        return None  # 查询 → 模型（红外查不到状态，模型按 ROUTER 规则如实说）
+    # 温度（可与模式组合）；取句中最后一个温度数字（防「16度以下不行15度」误取16）；
+    # 「调到/开到26」不带度字也算温度
+    m = re.findall(r"(\d{1,2})\s*度", question)
     if not m:
-        return None
-    temp = int(m.group(1))
-    if not (16 <= temp <= 30):
-        return f"空调只支持 16 到 30 度，{temp} 度没法设，先生。"
+        m2 = re.search(r"(?:调到|开到|设到|设置|设定|设为)\s*(\d{1,2})\s*$", question)
+        if m2:
+            m = [m2.group(1)]
+    if m:
+        temp = int(m[-1])
+        if not (16 <= temp <= 30):
+            return f"空调只支持 16 到 30 度，{temp} 度没法设，先生。"
+        if re.search(r"开|启动", question):
+            _ha_service("button", "press", {"entity_id": AC_TURN_ON_ENTITY})
+            time.sleep(0.5)  # 红外码间隔，防串码
+        mode = None
+        mode_cn = None
+        if re.search(r"制冷", question):
+            mode, mode_cn = "Cool", "制冷"
+        elif re.search(r"制热|取暖", question):
+            mode, mode_cn = "Heat", "制热"
+        elif re.search(r"除湿|抽湿", question):
+            mode, mode_cn = "Dry", "除湿"
+        elif re.search(r"送风|通风", question):
+            mode, mode_cn = "Fan", "送风"
+        if mode:
+            if not re.search(r"开|启动", question):
+                _ha_service("button", "press", {"entity_id": AC_TURN_ON_ENTITY})
+                time.sleep(0.5)
+            _ha_service("select", "select_option",
+                        {"entity_id": AC_MODE_ENTITY, "option": mode})
+            time.sleep(0.5)
+        _ha_service("number", "set_value", {"entity_id": AC_TEMP_ENTITY, "value": temp})
+        print(f"[bridge] 空调短路: {temp}度{mode or ''}", flush=True)
+        return (f"空调已经调到 {temp} 度、{mode_cn}模式了，先生。" if mode
+                else f"空调已经调到 {temp} 度，先生。")
+    # 模式
+    for pat, val, cn in [("制冷", "Cool", "制冷"), ("制热|取暖", "Heat", "制热"),
+                         ("除湿|抽湿", "Dry", "除湿"), ("送风|通风|换气", "Fan", "送风"),
+                         ("自动", "Auto", "自动")]:
+        if re.search(pat, question):
+            _ha_service("button", "press", {"entity_id": AC_TURN_ON_ENTITY})
+            time.sleep(0.5)
+            _ha_service("select", "select_option",
+                        {"entity_id": AC_MODE_ENTITY, "option": val})
+            print(f"[bridge] 空调短路: 模式{val}", flush=True)
+            return f"空调已经调到{cn}模式了，先生。"
+    # 风速±（红外按钮，无回读）
+    if re.search(r"风速|风量", question):
+        if re.search(r"大|高|加|升|快", question):
+            _ha_service("button", "press", {"entity_id": AC_FAN_UP_ENTITY})
+            print("[bridge] 空调短路: 风速+", flush=True)
+            return "空调风速已经调大了，先生。"
+        if re.search(r"小|低|减|降|慢|弱", question):
+            _ha_service("button", "press", {"entity_id": AC_FAN_DOWN_ENTITY})
+            print("[bridge] 空调短路: 风速-", flush=True)
+            return "空调风速已经调小了，先生。"
+    # 开关机
+    if re.search(r"关|停", question):
+        _ha_service("button", "press", {"entity_id": AC_TURN_OFF_ENTITY})
+        print("[bridge] 空调短路: 关机", flush=True)
+        return "空调已经关了，先生。"
     if re.search(r"开|启动", question):
         _ha_service("button", "press", {"entity_id": AC_TURN_ON_ENTITY})
-        time.sleep(0.5)  # 红外码间隔，防串码
-    _ha_service("number", "set_value", {"entity_id": AC_TEMP_ENTITY, "value": temp})
-    print(f"[bridge] 空调温度短路: {temp}度", flush=True)
-    return f"空调已经调到 {temp} 度，先生。"
+        print("[bridge] 空调短路: 开机", flush=True)
+        return "空调已经开了，先生。"
+    return None
 
+
+def _fan_shortcut(question: str) -> str | None:
+    """塔扇确定性短路：定时关机/扫风夹角/摇头/开关/模式（直吹风/自然风/睡眠风）/
+    风速（百分比/档位/大点小点）。风扇是本地直连有状态回读，大点小点读当前值再调。"""
+    if not (FAN_ENTITY and FAN_DELAY_ENTITY):
+        return None  # 未配置
+    if not re.search(r"风扇|塔扇|电扇|电风扇", question):
+        return None
+    if re.search(r"吗|有没有|是不是|状态|开了没|转了没", question):
+        return None  # 查询 → 模型
+    # 定时/延时关机（放最前：避免「10分钟后关」被「关」分支直接关机）
+    m = re.search(r"(\d+)\s*(分钟|分|小时|时|h)", question)
+    if m and re.search(r"延时|定时|后关|后停|倒计时|再关", question):
+        n = int(m.group(1))
+        if re.search(r"小时|时|h", m.group(2)):
+            n *= 60
+        n = max(0, min(480, n))
+        _ha_service("number", "set_value", {"entity_id": FAN_DELAY_ENTITY, "value": n})
+        print(f"[bridge] 风扇短路: 延时{n}分", flush=True)
+        return f"已设 {n} 分钟后自动关风扇，先生。"
+    # 扫风夹角（30/60/90/120/150 取最近合法值）
+    m2 = re.search(r"(\d+)\s*度", question)
+    if m2 and re.search(r"夹角|扫风角度|摆动角|摆角", question):
+        ang = min([30, 60, 90, 120, 150], key=lambda a: abs(a - int(m2.group(1))))
+        _ha_service("select", "select_option",
+                    {"entity_id": FAN_ANGLE_ENTITY, "option": str(ang)})
+        print(f"[bridge] 风扇短路: 夹角{ang}", flush=True)
+        return f"扫风夹角调到 {ang} 度了，先生。"
+    # 摇头/摆头/扫风
+    if re.search(r"摇头|摆头|扫风|摆动", question):
+        off = bool(re.search(r"别|不要|关|停|取消|不了", question))
+        _ha_service("fan", "oscillate",
+                    {"entity_id": FAN_ENTITY, "oscillating": not off})
+        print(f"[bridge] 风扇短路: 摇头{'关' if off else '开'}", flush=True)
+        return ("风扇停止摇头了，先生。" if off else "风扇开始摇头了，先生。")
+    # 关机
+    if re.search(r"关|停|闭", question):
+        _ha_service("fan", "turn_off", {"entity_id": FAN_ENTITY})
+        print("[bridge] 风扇短路: 关", flush=True)
+        return "风扇已经关了，先生。"
+    # 模式
+    preset = None
+    if re.search(r"自然风", question):
+        preset = "自然风"
+    elif re.search(r"直吹", question):
+        preset = "直吹风"
+    elif re.search(r"睡眠风|睡眠", question):
+        preset = "睡眠风"
+    if preset:
+        _ha_service("fan", "set_preset_mode",
+                    {"entity_id": FAN_ENTITY, "preset_mode": preset})
+        print(f"[bridge] 风扇短路: 模式{preset}", flush=True)
+        return f"风扇切到{preset}了，先生。"
+    # 风速
+    pct = None
+    if re.search(r"最大|最高|拉满|开到顶", question):
+        pct = 100
+    elif re.search(r"最小|最低", question):
+        pct = 10
+    elif (mm := re.search(r"(\d{1,3})\s*[%％]", question)):
+        pct = int(mm.group(1))
+    elif (mm := re.search(r"(\d{1,2})\s*档", question)):
+        n = int(mm.group(1))
+        pct = n * 20 if n <= 5 else n
+    elif re.search(r"风速|风量|调到|开到", question) and (mm := re.search(r"(\d{1,3})(?![分时hH秒])", question)):
+        pct = int(mm.group(1))
+    elif re.search(r"风大点|大点|风大|调大|高点|加大|加.*档", question):
+        try:
+            pct = _ha_state(FAN_ENTITY).get("attributes", {}).get("percentage", 50) + 20
+        except Exception:
+            pct = 70
+    elif re.search(r"风小点|小点|风小|调小|低点|减小|减.*档", question):
+        try:
+            pct = _ha_state(FAN_ENTITY).get("attributes", {}).get("percentage", 50) - 20
+        except Exception:
+            pct = 30
+    if pct is not None:
+        pct = max(10, min(100, int(pct)))
+        _ha_service("fan", "set_percentage",
+                    {"entity_id": FAN_ENTITY, "percentage": pct})
+        print(f"[bridge] 风扇短路: 风速{pct}%", flush=True)
+        return f"风扇风速调到 {pct}% 了，先生。"
+    # 开机
+    if re.search(r"开|启动", question):
+        _ha_service("fan", "turn_on", {"entity_id": FAN_ENTITY})
+        print("[bridge] 风扇短路: 开", flush=True)
+        return "风扇已经开了，先生。"
+    return None
+
+
+def _camera_shortcut(question: str) -> str | None:
+    """摄像头确定性短路：只处理开关（隐私遮蔽）。默认摄像头1号；
+    明说 2号/第二个 才动 2 号。看画面/配置类（夜视/侦测/巡航）走模型。"""
+    if not (CAM1_ON_ENTITY or CAM2_ON_ENTITY):
+        return None  # 未配置
+    if not re.search(r"摄像头|摄像机", question):
+        return None
+    if re.search(r"吗|有没有|是不是|状态|在不在|画面|看|夜视|侦测|巡航|灵敏度|音量|静音", question):
+        return None  # 查询/看画面/高级配置 → 模型
+    ent = CAM2_ON_ENTITY if re.search(r"摄像头\s*2|第二个|二号|2号", question) else CAM1_ON_ENTITY
+    if not ent:
+        return None
+    if re.search(r"关|休眠|停", question):
+        _ha_service("switch", "turn_off", {"entity_id": ent})
+        print(f"[bridge] 摄像头短路: 关 {ent[-10:]}", flush=True)
+        return "摄像头已经关了，先生。"
+    if re.search(r"开", question):
+        _ha_service("switch", "turn_on", {"entity_id": ent})
+        print(f"[bridge] 摄像头短路: 开 {ent[-10:]}", flush=True)
+        return "摄像头已经打开了，先生。"
+    return None
 
 def _ha_service(domain: str, service: str, data: dict) -> str:
     token = _load_env("HA_TOKEN")
@@ -1718,13 +1903,21 @@ def answer_question(question: str) -> str:
     route = intent.get("route", "flash")
     print(f"[bridge] 意图 {intent.get('domain')}.{intent.get('intent')} → {route}: {question[:30]}",
           flush=True)
-    # 空调调温确定性短路（与流式路径一致）
-    ac_short = _ac_temp_shortcut(question)
+    # 空调确定性短路（温度/模式/风速/开关机）
+    ac_short = _ac_shortcut(question)
     if ac_short:
         return ac_short
+    # 扫地机器人确定性短路
     vac_short = _vacuum_shortcut(question)
     if vac_short:
         return vac_short
+    # 塔扇/摄像头确定性短路
+    fan_short = _fan_shortcut(question)
+    if fan_short:
+        return fan_short
+    cam_short = _camera_shortcut(question)
+    if cam_short:
+        return cam_short
     if route == "native":
         return "（已交给官方小爱处理）"
     if route == "deep":
@@ -2557,16 +2750,27 @@ def answer_stream(question: str):
     route = intent.get("route", "flash")
     print(f"[bridge] 意图 {intent.get('domain')}.{intent.get('intent')} → {route}: {question[:30]}",
           flush=True)
-    # 空调调温确定性短路：红外空调无状态回读，模型工具链会反复搜索/多轮操作——
-    # 「空调+数字温度」直接 HA 设值，一次完成（先于所有路由判断）。
-    ac_short = _ac_temp_shortcut(question)
+    # 空调确定性短路（温度/模式/风速/开关机）
+    ac_short = _ac_shortcut(question)
     if ac_short:
         yield ac_short
         yield "<<dialogue:end>>"
         return
+    # 扫地机器人确定性短路
     vac_short = _vacuum_shortcut(question)
     if vac_short:
         yield vac_short
+        yield "<<dialogue:end>>"
+        return
+    # 塔扇/摄像头确定性短路
+    fan_short = _fan_shortcut(question)
+    if fan_short:
+        yield fan_short
+        yield "<<dialogue:end>>"
+        return
+    cam_short = _camera_shortcut(question)
+    if cam_short:
+        yield cam_short
         yield "<<dialogue:end>>"
         return
     if route == "native":
