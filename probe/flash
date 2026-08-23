@@ -21,28 +21,27 @@ if [ ! -f "$UPDATE_BIN" ]; then
    exit 1
 fi
 
-# 运行 update 命令
+# 运行 update 命令（免 eval：参数直传，无 shell 拼接注入面）
 run_update() {
-    local cmd="$UPDATE_BIN 2>/dev/null"
-    local need_spaces=0
-    
-    if [[ "$1" == "bulkcmd" ]]; then
-       need_spaces=1
-    fi
-    
-    cmd+=" $1"
+    local subcmd="$1"
     shift 1
-    
-    for arg in "$@"; do
-        if [[ $need_spaces == 1 ]]; then
-           cmd+=" \"     $arg\""
-        else
-           cmd+=" $arg"
-        fi
-    done
-    
-    echo -e "${CYAN}执行: $cmd${RESET}"
-    local result=$(eval "$cmd")
+    local args=("$UPDATE_BIN" "$subcmd")
+
+    # bulkcmd 需把后续参数并成一个带前导空格的串（update 工具约定）
+    if [[ "$subcmd" == "bulkcmd" ]]; then
+        local joined=""
+        for arg in "$@"; do
+            joined+="     $arg"
+        done
+        args+=("$joined")
+    else
+        args+=("$@")
+    fi
+
+    local display="${args[*]}"
+    echo -e "${CYAN}执行: $display${RESET}"
+    local result
+    result=$("${args[@]}" 2>/dev/null)
     echo -e "${YELLOW}$result${RESET}"
     
     if echo "$result" | grep -q "ERR"; then

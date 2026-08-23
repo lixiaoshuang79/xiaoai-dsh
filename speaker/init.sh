@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck shell=sh
 # 小爱音箱开机初始化（部署到音箱 /data/init.sh，由 /etc/rc.local 在开机时调起）
 sleep 10
 # 1. 官方小爱提示音静音（保留 wakeup_* 唤醒音；其余全部静音，每次开机重刷）

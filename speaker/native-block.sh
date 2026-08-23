@@ -1,10 +1,18 @@
 #!/bin/sh
+# shellcheck shell=sh
 # 音箱自主大脑（正常模式=Mac 在线）：
 #   每轮语音 RecognizeResult 落盘后立即杀官方进程（官方永远不发声、不执行、不放歌），
 #   问答/设备/媒体全部由本地 AI（Mac 上的桥）接管；
 #   官方重连后云端补发的响应由执行指令兜底（kill_official_execution）掐执行部件。
 # 直连模式（Mac 挂了，direct-mode.sh 置 /tmp/xdf_direct_mode）：
 #   官方放行设备/媒体，问答拦截官方抢答 + 直连大模型 + 本地 TTS 播报。
+#
+# ⚠️ 维护须知：修改本脚本部署到音箱后，必须 kill 掉旧的 tail 进程并重启守护——
+#   旧脚本逻辑已被加载进内存，不重启会继续跑旧逻辑。重启命令：
+#     kill $(pgrep -f '^tail -n 0 -F /tmp/mico_aivs_lab/instruction.log$') 2>/dev/null
+#     kill $(pgrep -f '/data/open-xiaoai/native-block.sh$') 2>/dev/null
+#     sleep 0.5
+#     /data/open-xiaoai/native-block.sh >/dev/null 2>&1 &
 #
 # 大模型配置从 /data/open-xiaoai/config.env 读取（由 xiaoai-dsh localhost
 # 后台生成部署），降级提示词从 /data/open-xiaoai/system_prompt.txt 读取。
@@ -18,6 +26,22 @@ LLM_KEY=""
 LLM_MODEL=""
 if [ -f "$CONF" ]; then
   . "$CONF" 2>/dev/null
+fi
+
+# ---- 配置值基础校验（防注入）----
+# LLM_BASE/LLM_KEY/LLM_MODEL 来自 config.env，会拼进 curl URL、Authorization 头
+# 与 JSON 请求体。虽然全部加双引号，仍限制字符集兜底：拒绝空白/引号/控制字符。
+if [ -n "$LLM_BASE" ] && printf '%s' "$LLM_BASE" | grep -q '[^A-Za-z0-9:/._-]'; then
+  echo "$(date +%H:%M:%S) invalid-LLM_BASE: rejected" >> /tmp/nb-trace.log
+  exit 1
+fi
+if [ -n "$LLM_KEY" ] && printf '%s' "$LLM_KEY" | grep -q '[^A-Za-z0-9._:@/+=-]'; then
+  echo "$(date +%H:%M:%S) invalid-LLM_KEY: rejected" >> /tmp/nb-trace.log
+  exit 1
+fi
+if [ -n "$LLM_MODEL" ] && printf '%s' "$LLM_MODEL" | grep -q '[^A-Za-z0-9._:/@-]'; then
+  echo "$(date +%H:%M:%S) invalid-LLM_MODEL: rejected" >> /tmp/nb-trace.log
+  exit 1
 fi
 
 if [ -f /data/open-xiaoai/system_prompt.txt ]; then
@@ -47,18 +71,27 @@ if [ "$(cat /tmp/native-block.pid 2>/dev/null)" != "$$" ]; then
   exit 0
 fi
 
-log() { echo "$(date +%H:%M:%S) $1" >> /tmp/nb-trace.log; }
+LOG_FILE="/tmp/nb-trace.log"
+log() {
+  # 轮转：超过 512KB 时只保留最近 2000 行，防止无限增长（busybox tail/mv 兼容）
+  if [ -f "$LOG_FILE" ] && [ "$(wc -c < "$LOG_FILE" 2>/dev/null)" -gt 524288 ]; then
+    tail -n 2000 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null
+    mv "$LOG_FILE.tmp" "$LOG_FILE" 2>/dev/null
+  fi
+  echo "$(date +%H:%M:%S) $1" >> "$LOG_FILE"
+}
 
 say() {
   # 本地 TTS 播报（XiaoMi_M88 男声，init.sh 已固定音色）
-  ubus call mibrain text_to_speech "{\"text\":\"$1\",\"save\":0}" >/dev/null 2>&1
+  # 文本嵌 JSON 前先转义反斜杠与双引号
+  tts_txt=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  ubus call mibrain text_to_speech "{\"text\":\"$tts_txt\",\"save\":0}" >/dev/null 2>&1
 }
 
 llm_ask() {
   # 直连大模型（OpenAI 兼容），返回回答文本；失败返回空
   [ -z "$LLM_KEY" ] && return 1
   [ -z "$LLM_BASE" ] && return 1
-  local q body
   q=$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')
   body=$(printf '{"model":"%s","messages":[{"role":"system","content":"%s"},{"role":"user","content":"%s"}],"thinking":{"type":"disabled"}}' \
     "$LLM_MODEL" "$LLM_SYSTEM" "$q")
@@ -74,15 +107,6 @@ restart_aivs() {
   else
     ( /etc/init.d/mico_aivs_lab restart >/dev/null 2>&1 & )
   fi
-}
-
-hook_loaded() {
-  # LD_PRELOAD 钩子是否在官方进程上生效
-  # （v3 钩子 = 官方写 Speak 指令瞬间零竞态杀 mediaplayer —— 官方 TTS 唯一播放者；
-  #   我们的 TTS/音乐走 miplayer，不受影响）
-  local aivs
-  aivs=$(pgrep -f '^/usr/bin/mico_aivs_lab$' | head -1)
-  [ -n "$aivs" ] && grep -q LD_PRELOAD /proc/$aivs/environ 2>/dev/null
 }
 
 kill_tts_chain() {
@@ -110,7 +134,11 @@ kill_official_leftovers() {
   # 这里无需预杀（避免误伤正在播放的本地 AI 播报）。
   ubus call mediaplayer player_play_operation '{"action":"stop"}' >/dev/null 2>&1
   mphelper pause >/dev/null 2>&1
-  for i in 1 2 3; do kill -9 $(/bin/pidof miplayer) 2>/dev/null; sleep 0.2; done
+  # 杀 miplayer 重试 3 次（0.2s 间隔）：防播放器进程被杀后又被拉起残留
+  for i in 1 2 3; do
+    for p in $(/bin/pidof miplayer 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
+    sleep 0.2
+  done
   # 清官方播放器状态（quickplayer 是官方媒体播放进程）
   ( /etc/init.d/quickplayer restart >/dev/null 2>&1 & )
 }
@@ -146,64 +174,74 @@ kill_official_execution() {
 }
 
 log "started"
-# tail -n 0：只读新增行，重启时不重放旧日志（避免刚启动就误杀一轮官方）
-tail -n 0 -F /tmp/mico_aivs_lab/instruction.log 2>/dev/null | while read -r line; do
-  name=$(printf '%s\n' "$line" | sed -n 's/.*"name":"\([A-Za-z_]*\)".*/\1/p')
-  [ -z "$name" ] && continue
+# ---- 主循环（tail 守护）----
+# tail -n 0：只读新增行，重启时不重放旧日志（避免刚启动就误杀一轮官方）。
+# 外层 while 重启保护：tail -F 在日志被删除/重建时会继续跟随，但若 tail 进程
+# 意外死亡（OOM/被杀），管道结束会导致整个守护静默退出——拦截失效 = 官方复活。
+# 因此管道结束后 sleep 1 自动重启，拦截守护绝不能死。
+while :; do
+  tail -n 0 -F /tmp/mico_aivs_lab/instruction.log 2>/dev/null | while read -r line; do
+    name=$(printf '%s\n' "$line" | sed -n 's/.*"name":"\([A-Za-z_]*\)".*/\1/p')
+    [ -z "$name" ] && continue
 
-  # ---- 官方响应执行指令补发兜底（正常/直连模式通用判断，直连放行官方） ----
-  case "$name" in
-    StartAnswer|Speak|Play|LOOP_MODE|SetProperty|InstructionControl|Execute|Group|wangyiyun)
-      if [ ! -f "$MODE_FLAG" ]; then
-        kill_official_execution "$name"
+    # ---- 官方响应执行指令补发兜底（正常/直连模式通用判断，直连放行官方） ----
+    case "$name" in
+      StartAnswer|Speak|Play|LOOP_MODE|SetProperty|InstructionControl|Execute|Group|wangyiyun)
+        if [ ! -f "$MODE_FLAG" ]; then
+          kill_official_execution "$name"
+        fi
+        continue
+        ;;
+    esac
+
+    [ "$name" = "RecognizeResult" ] || continue
+    case "$line" in
+      *'"is_final":true'*) ;;
+      *) continue ;;
+    esac
+    text=$(printf '%s\n' "$line" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p')
+    # 已知局限：ASR 文本若含转义引号（\"）会在此处截断——语音文本几乎不含引号，
+    # 截断只影响直连模式的问答内容，不影响拦截判定（判定只看 is_final + name）。
+    [ -z "$text" ] && continue
+
+    if [ -f "$MODE_FLAG" ]; then
+      # ---- 直连模式（Mac 挂了）：音箱自主兜底 ----
+      # 媒体/闹钟/音量等：放行官方（官方能力，Mac 挂了也能用）
+      printf '%s\n' "$text" | grep -qE "$EXCEPT" && continue
+      # 设备指令：放行官方小爱云端执行！
+      # Mac 挂时 HA 不可用，官方云端是唯一能控家里设备的通道；
+      # 若 Mac 其实没挂（误判），官方执行 + AI 执行会双执行（红外 toggle 灾难），
+      # 所以这里绝不能杀官方，必须让官方独占设备执行。
+      if printf '%s\n' "$text" | grep -qE "$DEVICE"; then
+        log "direct-device-let-official: $text"
+        continue
+      fi
+      # 非设备问答：杀官方抢答 + 大模型直连 + 本地 TTS
+      log "direct-mode: $text"
+      restart_aivs   # 杀掉官方 NLP/TTS，抢答
+      answer=$(llm_ask "$text")
+      if [ -n "$answer" ]; then
+        say "$answer"
+        log "direct-answer: $(printf '%.60s' "$answer")"
+      else
+        say "抱歉，云端大模型暂时也连不上，请稍后再试，先生。"
+        log "direct-fail: $text"
       fi
       continue
-      ;;
-  esac
-
-  [ "$name" = "RecognizeResult" ] || continue
-  case "$line" in
-    *'"is_final":true'*) ;;
-    *) continue ;;
-  esac
-  text=$(printf '%s\n' "$line" | sed -n 's/.*"text":"\([^"]*\)".*/\1/p')
-  [ -z "$text" ] && continue
-
-  if [ -f "$MODE_FLAG" ]; then
-    # ---- 直连模式（Mac 挂了）：音箱自主兜底 ----
-    # 媒体/闹钟/音量等：放行官方（官方能力，Mac 挂了也能用）
-    printf '%s\n' "$text" | grep -qE "$EXCEPT" && continue
-    # 设备指令：放行官方小爱云端执行！
-    # Mac 挂时 HA 不可用，官方云端是唯一能控家里设备的通道；
-    # 若 Mac 其实没挂（误判），官方执行 + AI 执行会双执行（红外 toggle 灾难），
-    # 所以这里绝不能杀官方，必须让官方独占设备执行。
-    if printf '%s\n' "$text" | grep -qE "$DEVICE"; then
-      log "direct-device-let-official: $text"
-      continue
     fi
-    # 非设备问答：杀官方抢答 + 大模型直连 + 本地 TTS
-    log "direct-mode: $text"
-    restart_aivs   # 杀掉官方 NLP/TTS，抢答
-    answer=$(llm_ask "$text")
-    if [ -n "$answer" ]; then
-      say "$answer"
-      log "direct-answer: $(printf '%.60s' "$answer")"
-    else
-      say "抱歉，云端大模型暂时也连不上，请稍后再试，先生。"
-      log "direct-fail: $text"
-    fi
+
+    # ---- 正常模式：官方全禁 ----
+    # 每轮语音拿到 RecognizeResult 后立即杀官方进程（restart_aivs 保 hook 自动重启）：
+    # 云端下发的官方 TTS/新闻电台/媒体/执行指令全部进不来——官方永远不发声、不执行。
+    # ASR 结果在杀之前已写入 instruction.log，migpt/本地 AI 链路不受影响；
+    # 官方重启后自动重连云端，下一轮语音识别照常（用户说话间隔远大于重连时间）。
+    # 孙燕姿事故补强：官方 TTS 由 v3 钩子拦截、媒体链由 quickplayer/mediaplayer
+    # 独立进程执行，官方响应快时可能已抢先下发——同步掐掉残留。
+    restart_aivs
+    kill_official_leftovers
+    log "blocked-all: $text"
     continue
-  fi
-
-  # ---- 正常模式：官方全禁 ----
-  # 每轮语音拿到 RecognizeResult 后立即杀官方进程（restart_aivs 保 hook 自动重启）：
-  # 云端下发的官方 TTS/新闻电台/媒体/执行指令全部进不来——官方永远不发声、不执行。
-  # ASR 结果在杀之前已写入 instruction.log，migpt/本地 AI 链路不受影响；
-  # 官方重启后自动重连云端，下一轮语音识别照常（用户说话间隔远大于重连时间）。
-  # 孙燕姿事故补强：官方 TTS 由 v3 钩子拦截、媒体链由 quickplayer/mediaplayer
-  # 独立进程执行，官方响应快时可能已抢先下发——同步掐掉残留。
-  restart_aivs
-  kill_official_leftovers
-  log "blocked-all: $text"
-  continue
+  done
+  log "tail-exited: 守护自动重启"
+  sleep 1
 done

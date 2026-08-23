@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python (3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile all Python sources
+        run: python3 -m compileall -q bridge admin
+      - name: Run unit tests (bridge + admin)
+        run: |
+          # unittest discover 在目录无 test_*.py 时退出码为 0（"Ran 0 tests"），可安全并写
+          python3 -m unittest discover -s bridge -p 'test_*.py'
+          python3 -m unittest discover -s admin -p 'test_*.py'
+
+  node:
+    name: Node (migpt, pnpm)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: migpt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: migpt/pnpm-lock.yaml
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Test
+        run: pnpm test
+
+  rust:
+    name: Rust (migpt)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: migpt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check vendored open-xiaoai present
+        run: |
+          if [ ! -d ../packages/client-rust ]; then
+            echo "::error::缺少 packages/client-rust（Cargo.toml 依赖 ../packages/client-rust 的 vendor 源码）"
+            exit 1
+          fi
+      - name: Cargo check
+        run: cargo check
+      - name: Cargo test
+        run: cargo test
+
+  shellcheck:
+    name: Shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run shellcheck
+        run: shellcheck -S warning speaker/*.sh bridge/*.sh
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run secret scan
+        run: bash scripts/secret-scan.sh
