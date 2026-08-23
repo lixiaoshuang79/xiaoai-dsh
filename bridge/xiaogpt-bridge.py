@@ -158,11 +158,12 @@ def _discover_devices(force: bool = False) -> dict:
     fill("AC_TURN_OFF_ENTITY", find(lambda s: s["entity_id"].startswith("button.") and "turn_off" in s["entity_id"]))
     fill("AC_FAN_UP_ENTITY", find(lambda s: "fan_speed_up" in s["entity_id"]))
     fill("AC_FAN_DOWN_ENTITY", find(lambda s: "fan_speed_down" in s["entity_id"]))
-    # 摄像头：名字带「摄像」的开关实体（on_p_2_1），按 ID 排序取前两台
+    # 摄像头：电源开关 = switch 域 + 实体 ID 以 on_p_2_1 结尾 + 名字/ID 含摄像；
+    # 不用名字里带「开关」匹配——异响检测/区域显示等一堆配置开关都带这两个字
     cams = sorted(s["entity_id"] for s in states
                   if s["entity_id"].startswith("switch.")
-                  and ("摄像" in fname(s) or "摄像" in s["entity_id"])
-                  and ("开关" in fname(s) or "on_p_2_1" in s["entity_id"]))
+                  and s["entity_id"].endswith("on_p_2_1")
+                  and ("摄像" in fname(s) or "摄像" in s["entity_id"]))
     if len(cams) >= 1:
         fill("CAM1_ON_ENTITY", cams[0])
     if len(cams) >= 2:
@@ -172,8 +173,10 @@ def _discover_devices(force: bool = False) -> dict:
     fill("VACUUM_MODE_ENTITY", find(lambda s: s["entity_id"].startswith("select.") and "cleaning_mode" in s["entity_id"]))
     # 灯：只认名字明显的（吸顶灯/大灯/主灯、氛围灯），找不到就留空走通用规则
     fill("MAIN_LIGHT_ENTITY",
-         find(lambda s: ("吸顶灯" in fname(s) or "大灯" in fname(s) or "主灯" in fname(s))
-              and "氛围" not in fname(s)))
+         find(lambda s: s["entity_id"].startswith(("switch.", "light."))
+              and ("吸顶灯" in fname(s) or "大灯" in fname(s) or "主灯" in fname(s))
+              and "氛围" not in fname(s) and "指示" not in fname(s)
+              and "indicator" not in s["entity_id"]))
     fill("AMBIENT_LIGHT_ENTITY", find(lambda s: "氛围灯" in fname(s)))
     # 音箱音量：media_player 名字带「音箱/小爱」的第一台
     fill("SPEAKER_PLAYER",
@@ -3151,10 +3154,14 @@ def main() -> int:
         port = int(sys.argv[sys.argv.index("--port") + 1])
     daily_cleanup()  # 启动时清理过期话题档案与 headless 会话文件
     _discover_devices()  # config 留空的设备实体自动从 HA 发现（日志见 [bridge] 设备自动发现）
-    # 保障音箱项目文件夹有 checkout 的 node_modules（tsx 与依赖解析依赖它）
+    # 保障音箱项目文件夹有 checkout 的 node_modules（tsx 与依赖解析依赖它）；
+    # checkout 还没配置/不存在时跳过（深通道不可用，其余通道照常）
     nm_link = os.path.join(SPEAKER_HOME, "node_modules")
-    if not os.path.islink(nm_link):
-        os.symlink(os.path.join(CHECKOUT, "node_modules"), nm_link)
+    if os.path.isdir(CHECKOUT) and os.path.isdir(SPEAKER_HOME) and not os.path.islink(nm_link):
+        try:
+            os.symlink(os.path.join(CHECKOUT, "node_modules"), nm_link)
+        except OSError:
+            pass
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     # 本地提醒后台线程（官方小爱已全禁，闹钟/提醒由桥侧队列 + 到点推送播报）
     threading.Thread(target=_reminder_loop, daemon=True).start()
