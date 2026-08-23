@@ -46,7 +46,7 @@ python3 admin/server.py [--port 8390]
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `ip` | string | 音箱局域网 IP（示例 192.168.1.x，按实际网络填写） |
+| `ip` | string | 音箱局域网 IP（示例 `192.0.2.100`，按实际网络填写；RFC5737 保留地址仅作示例） |
 | `did` | string | 音箱 miot DID（同上，写进 xiaogpt-config.yml） |
 | `tts_vendor` | string | 音箱 TTS 音色，示例 `XiaoMi_M88`（男声「青葱」）；init.sh 开机固定 |
 
@@ -54,7 +54,7 @@ python3 admin/server.py [--port 8390]
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `ip` | string | Mac 局域网 IP（示例 192.168.1.x，按实际网络填写）。写进音箱端 config.env 的 MAC_IP，直连模式探测用它（4397/healthz） |
+| `ip` | string | Mac 局域网 IP（示例 `192.0.2.100`，按实际网络填写；RFC5737 保留地址仅作示例）。写进音箱端 config.env 的 MAC_IP，直连模式探测用它（4397/healthz） |
 
 ### 1.6 `devices` — 关键设备实体
 

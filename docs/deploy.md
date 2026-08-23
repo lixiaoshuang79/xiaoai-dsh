@@ -63,7 +63,7 @@
 |---|---|---|
 | macOS | 任意（Apple Silicon / Intel 均可） | 本机大脑运行平台 |
 | Python | 3.10+ | 桥、配置后台（纯标准库；辅助脚本需 aiohttp / cryptography / playwright） |
-| Node.js | ≥ 16（建议 18+） | migpt 引擎 |
+| Node.js | ≥ 20 | migpt 引擎（使用原生 fetch，16/18 无法运行） |
 | pnpm | 9.x（仓库 packageManager 为 pnpm@9.15.9） | migpt 依赖管理 |
 | Rust 工具链（cargo） | 需要 Xcode Command Line Tools（含 clang） | 编译 migpt 的 Rust neon 插件 open-xiaoai.node |
 | OpenAI 兼容大模型 API | 快模型 + 深模型两个模型名 | 回答大脑；支持 reasoning 更佳 |
@@ -359,13 +359,13 @@ launchctl bootout gui/$(id -u)/com.<你的域名>.xiaogpt-bridge
 | 端口 | 服务 | 验证命令 | 正常表现 |
 |---|---|---|---|
 | 8390 | admin 后台 | `curl -s http://127.0.0.1:8390/api/config` | 返回 JSON（含 `_is_example` 等字段） |
-| 8322 | 桥 | `curl -s http://127.0.0.1:8322/v1/models` | HTTP 200 + 模型列表 JSON |
+| 8322 | 桥 | `curl -s http://127.0.0.1:8322/v1/models` | HTTP 200 + 模型列表 JSON（/v1/models 无鉴权；chat/completions 需 Bearer <bridge.secret>） |
 | 8321 | hass-mcp | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8321/mcp` | 返回非 000（4xx/5xx 也算服务在听） |
 | 4397 | migpt healthz | `curl -s http://127.0.0.1:4397/healthz` | `{"ok":true}` |
-| 4398 | migpt /play | `curl -s -X POST http://127.0.0.1:4398/play -H 'Content-Type: application/json' -d '{"text":"测试播报"}'` | `{"ok":true}` 且音箱播报 |
-| 4398 | migpt /exec | `curl -s -X POST http://127.0.0.1:4398/exec -H 'Content-Type: application/json' -d '{"cmd":"echo ok"}'` | `{"ok":true,...}`（在音箱上执行成功） |
+| 4398 | migpt /play | `curl -s -X POST http://127.0.0.1:4398/play -H "Authorization: Bearer <bridge.secret>" -H 'Content-Type: application/json' -d '{"text":"测试播报"}'` | `{"ok":true}` 且音箱播报 |
+| 4398 | migpt /exec | `curl -s -X POST http://127.0.0.1:4398/exec -H "Authorization: Bearer <bridge.secret>" -H 'Content-Type: application/json' -d '{"cmd":"echo ok"}'` | `{"ok":true,...}`（在音箱上执行成功） |
 | 4399 | migpt WS | 音箱 client 连接后看 migpt 日志 | `nc -z 127.0.0.1 4399` 通 |
-| 4378 | web-audio 转发 | 点歌触发后 `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4378/` | 200/302（无播放时可能不监听，正常） |
+| 4378 | web-audio 转发 | 点歌触发后 `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4378/ping` | 200（无播放时可能不监听，正常） |
 | 8123 | HA | `curl -s -H "Authorization: Bearer <HA Token>" http://127.0.0.1:8123/api/` | `{"message":"API running."}` |
 
 音箱端（SSH 到音箱执行）：

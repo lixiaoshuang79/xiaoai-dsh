@@ -40,11 +40,31 @@
 | `probe/` | 刷机脚本封装和 USB 诊断程序 |
 | `skills/speaker-skills/` | 给深模型复用的技能（按任务匹配注入） |
 | `config/` | 配置模板 `config.example.json`；你本机的真实配置 `local.json` 不进仓库 |
+| `test/` | 各组件回归测试：`bridge/test_bridge.py`、`admin/test_admin.py`、`migpt/test/`、Rust 单元测试（`cargo test`） |
+
+## 开发环境
+
+- macOS（刷机工具链只支持 macOS；桥本身是纯 Python 3.10+）；
+- Node.js ≥ 20（migpt 引擎用原生 fetch）；
+- Rust stable（`migpt/` 与 `packages/client-rust/`）；
+- Python 3.10+（bridge / admin，标准库 + 少量依赖）。
+
+运行全部测试：
+
+```bash
+python3 -m unittest discover -s bridge -p 'test_*.py'    # 桥
+python3 admin/test_admin.py                              # 配置后台
+cd migpt && pnpm install && pnpm typecheck && pnpm test  # 引擎（TS）
+cd migpt && cargo test --locked                           # 引擎（Rust）
+```
 
 ## 安全
 
 - 大模型 Key、HA Token、小米账号密码只存在本机 `config/local.json`（权限 600），不进仓库；
-- 配置后台只监听 127.0.0.1；
+- 配置后台只监听 127.0.0.1（8390），并要求 `X-Admin-Token`（启动时生成，存 `config/local-admin.token`）；
+- 桥（8322）与 migpt（4398）之间的所有推送/执行端点要求 `Authorization: Bearer <bridge.secret>`（后台保存配置时自动生成 32 位 hex）；桥的 `/v1/chat/completions` 同样要求该 secret；
+- 音箱端 WebSocket（4399）支持可选来源 IP allowlist + 共享 secret 认证（`XIAOAI_WS_ALLOWLIST` / `XIAOAI_WS_SECRET`，部署时按需开启，见 docs/deploy.md）；
+- web-audio 流式转发 relay（4378）只代理公网音频流（拒绝内网/本机地址），且流地址带随机访问令牌，局域网其他设备无法旁听；
 - 音箱端配置文件里带大模型 Key（Mac 失联时音箱要能自己直连），只部署到你自己刷过机的音箱；
 - 刷机后先改音箱 root 密码——上游默认密码是公开的（见 flashing.md）；
 - 发现安全问题请私下报告，见 [SECURITY.md](SECURITY.md)。

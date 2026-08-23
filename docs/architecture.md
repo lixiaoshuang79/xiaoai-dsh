@@ -77,14 +77,14 @@ xiaoai-dsh 把小米 AI 音箱改造成「本地大模型语音管家」：音�
 
 | 端口 | 进程 | 监听 | 用途 |
 |------|------|------|------|
-| 8322 | xiaogpt-bridge | 127.0.0.1 | OpenAI 兼容端点（/v1/chat/completions、/v1/models），migpt 的唯一 AI 上游 |
+| 8322 | xiaogpt-bridge | 127.0.0.1 | OpenAI 兼容端点（/v1/chat/completions、/v1/models），migpt 的唯一 AI 上游；/v1/chat/completions 需 `Bearer <bridge.secret>`，/v1/models 无鉴权（健康探测用） |
 | 8321 | hass-mcp | 127.0.0.1 | Home Assistant 全量工具 MCP（Streamable HTTP） |
-| 4399 | migpt（open-xiaoai） | 局域网 | 音箱端 client 的 WebSocket 连接 |
-| 4398 | migpt（HTTP 端点） | 127.0.0.1 | /exec（音箱 shell，限本机）、/play（推送播报）、/play_url（音频播放）、/native（原生执行通道） |
+| 4399 | migpt（open-xiaoai） | 局域网（默认 0.0.0.0） | 音箱端 client 的 WebSocket 连接；可选 allowlist + 共享 secret 认证（XIAOAI_WS_ALLOWLIST / XIAOAI_WS_SECRET，未配置时完全兼容旧 client 并警告） |
+| 4398 | migpt（HTTP 端点） | 127.0.0.1 | /exec（音箱 shell，限本机）、/play（推送播报）、/play_url（音频播放）、/native（原生执行通道）；全部要求 `Bearer <bridge.secret>` |
 | 4397 | migpt（healthz） | 0.0.0.0 | /healthz 纯 HTTP 健康检查，音箱端直连模式探测 Mac 存活 |
-| 4378 | web-audio-play relay | 127.0.0.1 | 防盗链音频流式转发（带 Referer/UA，零落盘），30 分钟无请求自动退出 |
+| 4378 | web-audio-play relay | 0.0.0.0 | 防盗链音频流式转发（带 Referer/UA，零落盘，只代理公网流，流地址带随机访问令牌），30 分钟无请求自动退出；音箱经 `http://<Mac-IP>:4378/s/<token>` 拉流 |
 | 8123 | Home Assistant | 127.0.0.1 | HA REST API / WebSocket |
-| 8390 | admin/server.py | 127.0.0.1 | 本地配置后台（读写 config/local.json，生成派生文件） |
+| 8390 | admin/server.py | 127.0.0.1 | 本地配置后台（读写 config/local.json，生成派生文件；要求 X-Admin-Token） |
 
 ## 3. 音箱端拦截与双模式
 
