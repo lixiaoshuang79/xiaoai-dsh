@@ -3,14 +3,14 @@
 #   每轮语音 RecognizeResult 落盘后立即杀官方进程（官方永远不发声、不执行、不放歌），
 #   问答/设备/媒体全部由本地 AI（Mac 上的桥）接管；
 #   官方重连后云端补发的响应由执行指令兜底（kill_official_execution）掐执行部件。
-# 直连模式（Mac 挂了，direct-mode.sh 置 /tmp/direct_mode）：
+# 直连模式（Mac 挂了，direct-mode.sh 置 /tmp/xdf_direct_mode）：
 #   官方放行设备/媒体，问答拦截官方抢答 + 直连大模型 + 本地 TTS 播报。
 #
 # 大模型配置从 /data/open-xiaoai/config.env 读取（由 xiaoai-dsh localhost
 # 后台生成部署），降级提示词从 /data/open-xiaoai/system_prompt.txt 读取。
 DEVICE='开|关|打开|关闭|调|亮度|色温|模式|风速|扫|拖|加湿|除湿|灯|插座|风扇|窗帘|热水器|空调|净化|开关|电源|温度'
 EXCEPT='放|播放|唱|来首|听|歌|音乐|故事|新闻|电台|广播|闹钟|提醒|倒计时|音量|声音|上一首|下一首|暂停|继续|晚安|早安|起床'
-MODE_FLAG="/tmp/direct_mode"
+MODE_FLAG="/tmp/xdf_direct_mode"
 
 CONF="/data/open-xiaoai/config.env"
 LLM_BASE=""

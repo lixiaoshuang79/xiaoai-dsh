@@ -236,36 +236,65 @@ static int official_leak_markers(const unsigned char *p, long n) {
         || has_marker(p, n, "APP");
 }
 
+/* 官方媒体执行指令名（点歌/播放链）：与 native-block kill_official_execution 的
+ * media 分支同集合。官方写这些指令到 instruction.log 的瞬间，播放器已在调度中
+ * （云端响应快时先出声、脚本 tail 拦截慢 1 秒）——这里零延迟杀 mediaplayer。
+ * 只杀 mediaplayer 不杀官方进程：云端认为指令已送达，不再补发，无死循环。 */
+static int is_media_name(const unsigned char *p, long n) {
+    return has_marker(p, n, "\"name\":\"wangyiyun\"")
+        || has_marker(p, n, "\"name\":\"Play\"")
+        || has_marker(p, n, "\"name\":\"LOOP_MODE\"")
+        || has_marker(p, n, "\"name\":\"SetProperty\"")
+        || has_marker(p, n, "\"name\":\"InstructionControl\"")
+        || has_marker(p, n, "\"name\":\"Group\"");
+}
+
 /*
- * Speak 判定：
- *   直连模式 → 放行；
- *   官方版权失败话术（试听/黑胶/会员/版权/APP）→ 杀 mediaplayer；
- *   我们正在作答（pending ≤15s）→ 杀 mediaplayer（官方抢答）；
- *   其余（闹钟/音量等官方独占确认）→ 放行。
+ * write 判定：
+ *   直连模式（/tmp/xdf_direct_mode）→ 全部放行（官方是唯一通道）；
+ *   Speak/StartAnswer：
+ *     官方版权失败话术（试听/黑胶/会员/版权/APP）→ 杀 mediaplayer；
+ *     我们正在作答（pending ≤15s）→ 杀 mediaplayer（官方抢答）；
+ *     其余（闹钟/音量等官方独占确认）→ 放行。
+ *   媒体执行指令（wangyiyun/Play/LOOP_MODE/SetProperty/InstructionControl/Group）：
+ *     闹钟响铃（is_alarm:true）→ 放行；
+ *     其余 → 杀 mediaplayer（官方点歌/新闻/歌单的播放者，我们走 miplayer 零影响）。
  */
 static void check_write(const unsigned char *p, long n) {
     int m, dm;
     long pe, age;
     if (!p || n <= 0) return;
-    m = has_marker(p, n, "\"name\":\"Speak\"");
-    if (!m) return;
     dm = direct_mode();
-    if (dm) { log_line("DIRECT-SKIP", 1); return; }
-    if (official_leak_markers(p, n)) {
-        log_raw("LEAK-KILL ", p, n);
-        kill_mediaplayer();
+    m = has_marker(p, n, "\"name\":\"Speak\"")
+        || has_marker(p, n, "\"name\":\"StartAnswer\"");
+    if (m) {
+        if (dm) { log_line("DIRECT-SKIP", 1); return; }
+        if (official_leak_markers(p, n)) {
+            log_raw("LEAK-KILL ", p, n);
+            kill_mediaplayer();
+            return;
+        }
+        pe = pending_epoch();
+        age = (pe > 0) ? (now_epoch() - pe) : 9999;
+        log_line("DBG pe=", (int)pe);
+        log_line("DBG age=", (int)age);
+        if (pe > 0 && age >= 0 && age <= 15) {
+            log_raw("PEND-KILL ", p, n);
+            kill_mediaplayer();
+            return;
+        }
+        log_raw("PASS ", p, n);
         return;
     }
-    pe = pending_epoch();
-    age = (pe > 0) ? (now_epoch() - pe) : 9999;
-    log_line("DBG pe=", (int)pe);
-    log_line("DBG age=", (int)age);
-    if (pe > 0 && age >= 0 && age <= 15) {
-        log_raw("PEND-KILL ", p, n);
+    if (is_media_name(p, n)) {
+        if (dm) { log_line("DIRECT-SKIP-MEDIA", 1); return; }
+        if (has_marker(p, n, "is_alarm\":true")) {
+            log_raw("MEDIA-ALARM-PASS ", p, n);
+            return;
+        }
+        log_raw("MEDIA-KILL ", p, n);
         kill_mediaplayer();
-        return;
     }
-    log_raw("PASS ", p, n);
 }
 
 struct iovec32 { u32 iov_base; u32 iov_len; };

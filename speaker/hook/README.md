@@ -34,9 +34,17 @@ mediaplayer**（必须全杀——重启残留的僵尸进程 comm 仍匹配，�
 | 本地 AI 作答中（`/tmp/xdf_our_pending` 15s 内，migpt beginAnswer + speaker.play 写 epoch） | 时间窗 | PEND-KILL |
 | 闹钟/音量等官方独占确认（native 放行路径） | 均不命中 | PASS 放行 |
 
+**媒体指令零延迟拦截（v5，2026-08-23 清晨「官方补发点歌」事故根治）**：
+官方写媒体执行指令（wangyiyun/Play/LOOP_MODE/SetProperty/InstructionControl/
+Group）到 instruction.log 的瞬间杀光 mediaplayer——云端补发昨晚未送达的点歌
+会话时（官方进程崩溃被 procd 拉起 → 重连云 → 云端重放 8 小时前的会话），
+音乐一个字都来不及响。只杀 mediaplayer 不杀官方进程：云端认为指令已送达、
+不再补发，无死循环。闹钟响铃（指令 payload 带 `is_alarm:true`）放行。
+直连模式（`/tmp/xdf_direct_mode` 存在）钩子放行官方 TTS 与媒体。
+
 `native-block.sh` 兜底：Speak 落盘后 0.6s 查无存活 mediaplayer（`/proc/stat`
 排除 Z 僵尸）才延时重启；官方 TTS 调度失败不重试，杀 mediaplayer 不杀官方
-进程 = 无云端补发死循环。直连模式（`/tmp/direct_mode` 存在）钩子放行官方 TTS。
+进程 = 无云端补发死循环。
 
 ## 部署
 

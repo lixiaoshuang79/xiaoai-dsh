@@ -1,6 +1,6 @@
 #!/bin/sh
 # 音箱自主大脑守护：探测本地电脑（Mac）是否存活。
-# Mac 挂了（migpt/桥全断）-> 切换「直连模式」（/tmp/direct_mode），
+# Mac 挂了（migpt/桥全断）-> 切换「直连模式」（/tmp/xdf_direct_mode），
 # native-block.sh 看到该标志后：问答直连大模型 + 本地 TTS 播报；
 # 设备指令放行官方小爱执行（Mac 挂时官方云端是唯一设备控制通道）。
 # Mac 恢复 -> 摘掉标志，回到正常模式（本地 AI 全功能）。
@@ -17,7 +17,7 @@ if [ -f "$CONF" ]; then
   [ -n "$MAC_IP" ] && MAC="$MAC_IP"
 fi
 [ -z "$MAC" ] && MAC="192.168.1.100"
-MODE_FLAG="/tmp/direct_mode"
+MODE_FLAG="/tmp/xdf_direct_mode"
 FAIL=0
 OK=0
 
