@@ -19,6 +19,7 @@
 MAC=""
 CONF="/data/open-xiaoai/config.env"
 if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090  # 配置文件由后台运行时生成，路径非常量
   . "$CONF" 2>/dev/null
   [ -n "$MAC_IP" ] && MAC="$MAC_IP"
 fi

@@ -25,6 +25,7 @@ LLM_BASE=""
 LLM_KEY=""
 LLM_MODEL=""
 if [ -f "$CONF" ]; then
+  # shellcheck disable=SC1090  # 配置文件由后台运行时生成，路径非常量
   . "$CONF" 2>/dev/null
 fi
 
@@ -135,7 +136,7 @@ kill_official_leftovers() {
   ubus call mediaplayer player_play_operation '{"action":"stop"}' >/dev/null 2>&1
   mphelper pause >/dev/null 2>&1
   # 杀 miplayer 重试 3 次（0.2s 间隔）：防播放器进程被杀后又被拉起残留
-  for i in 1 2 3; do
+  for _ in 1 2 3; do
     for p in $(/bin/pidof miplayer 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
     sleep 0.2
   done
