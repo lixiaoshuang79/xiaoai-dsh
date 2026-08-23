@@ -114,11 +114,11 @@ mod tests {
     #[test]
     fn resolve_off_env_wins() {
         assert_eq!(
-            resolve_auth_mode(Some("s"), Some("1.2.3.4"), Some("off")),
+            resolve_auth_mode(Some("s"), Some("192.0.2.4"), Some("off")),
             AuthMode::Off
         );
         assert_eq!(
-            resolve_auth_mode(Some("s"), Some("1.2.3.4"), Some(" OFF ")),
+            resolve_auth_mode(Some("s"), Some("192.0.2.4"), Some(" OFF ")),
             AuthMode::Off
         );
     }
@@ -128,9 +128,9 @@ mod tests {
         assert_eq!(resolve_auth_mode(None, None, None), AuthMode::Off);
         assert_eq!(resolve_auth_mode(Some(""), None, None), AuthMode::Off);
         assert_eq!(resolve_auth_mode(Some("s"), None, None), AuthMode::Secret);
-        assert_eq!(resolve_auth_mode(None, Some("1.2.3.4"), None), AuthMode::IpOnly);
+        assert_eq!(resolve_auth_mode(None, Some("192.0.2.4"), None), AuthMode::IpOnly);
         assert_eq!(
-            resolve_auth_mode(Some("s"), Some("1.2.3.4"), None),
+            resolve_auth_mode(Some("s"), Some("192.0.2.4"), None),
             AuthMode::SecretAndIp
         );
         // 空字符串 allowlist 视为未配置
@@ -142,10 +142,10 @@ mod tests {
 
     #[test]
     fn parse_allowlist_handles_whitespace_and_empty() {
-        let set = parse_allowlist("192.168.1.10, 192.168.1.11 ,,  ,");
+        let set = parse_allowlist("192.0.2.10, 192.0.2.11 ,,  ,");
         assert_eq!(set.len(), 2);
-        assert!(set.contains("192.168.1.10"));
-        assert!(set.contains("192.168.1.11"));
+        assert!(set.contains("192.0.2.10"));
+        assert!(set.contains("192.0.2.11"));
         assert!(parse_allowlist("").is_empty());
         assert!(parse_allowlist(" , , ").is_empty());
     }

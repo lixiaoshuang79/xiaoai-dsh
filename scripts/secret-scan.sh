@@ -29,15 +29,14 @@ EXCLUDES=(
   ':(exclude)docs'
 )
 
-# IP 检查额外豁免：测试文件（语义必需的示例/恶意样本 IP，非真实网络信息）。
+# IP 检查额外豁免：仅豁免**必须验证私网/公网 IP 语义**的测试文件
+# （isBlockedHostname/validate_audio_url 等测试用例的样本 IP，非真实网络信息）。
 # 仅豁免「疑似真实 IP」检查；密钥模式检查（run_grep 默认路径）仍覆盖这些文件。
-# 新增测试文件时若含示例 IP，须在此登记，否则 CI 会红。
+# 新增含示例 IP 的测试文件时须在此登记（附理由），否则 CI 会红。
+# 注意：仅能换 RFC5737 的样本（如纯解析/示例值）一律先换，不要进此名单。
 EXCLUDES_IP=(
-  ':(exclude)admin/test_admin.py'
-  ':(exclude)bridge/test_bridge.py'
-  ':(exclude)migpt/src/auth.rs'
-  ':(exclude)migpt/test/speaker-gate.test.ts'
-  ':(exclude)migpt/test/config.test.ts'
+  ':(exclude)bridge/test_bridge.py'              # validate_audio_url 私网/公网语义测试
+  ':(exclude)migpt/test/speaker-gate.test.ts'    # isBlockedHostname 私网/公网语义测试
 )
 
 # 常见密钥模式（git grep 扩展正则；不要加会命中模板代码的宽松模式）
@@ -76,7 +75,7 @@ is_safe_ip() {
   case "$1" in
     127.*|0.*|255.255.255.255) return 0 ;;
     192.0.2.*|198.51.100.*|203.0.113.*) return 0 ;;
-    169.254.*) return 0 ;;  # link-local 保留段（含云 metadata 169.254.169.254；代码里作为 SSRF 拒绝面出现）
+    169.254.169.254) return 0 ;;  # 云 metadata 保留地址（代码里作为 SSRF 拒绝面出现；精确例外，不放行其他 link-local）
   esac
   return 1
 }

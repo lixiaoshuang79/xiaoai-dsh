@@ -51,7 +51,7 @@ def valid_cfg() -> dict:
             "system_prompt": "你是小爱。",
         },
         "home_assistant": {
-            "url": "http://192.168.1.10:8123",
+            "url": "http://192.0.2.10:8123",
             "token": "tok_abcdef0123456789",
         },
         "xiaomi_account": {
@@ -60,11 +60,11 @@ def valid_cfg() -> dict:
             "device_id": "did12345",
         },
         "speaker": {
-            "ip": "192.168.1.100",
+            "ip": "192.0.2.100",
             "did": "1234567890",
             "tts_vendor": "XiaoMi_M88",
         },
-        "mac": {"ip": "192.168.1.13"},
+        "mac": {"ip": "192.0.2.13"},
         "devices": {
             "main_light": "switch.abc", "ambient_light": "", "speaker_volume": "",
             "speaker_volume_2": "", "ac_temperature": "", "ac_turn_on": "",
@@ -239,7 +239,7 @@ class AdminServerTest(unittest.TestCase):
         self.assertEqual(st, 403)
 
     def test_host_nonloopback_ip_rejected(self):
-        st, _, _ = self.get("/", host="192.168.1.13:%d" % self.port)
+        st, _, _ = self.get("/", host="192.0.2.13:%d" % self.port)
         self.assertEqual(st, 403)
 
     # ---------------- Origin 矩阵 ----------------
@@ -408,7 +408,7 @@ class AdminServerTest(unittest.TestCase):
 
     def test_bad_mac_ip_rejected(self):
         cfg = valid_cfg()
-        cfg["mac"]["ip"] = "1.2.3.4;rm -rf"
+        cfg["mac"]["ip"] = "192.0.2.4;rm -rf"
         st, _, _ = self.post_cfg(cfg)
         self.assertEqual(st, 400)
         cfg2 = valid_cfg()
@@ -456,7 +456,7 @@ class AdminServerTest(unittest.TestCase):
         server.generate_derived = boom
         try:
             bad = valid_cfg()
-            bad["mac"]["ip"] = "192.168.1.99"
+            bad["mac"]["ip"] = "192.0.2.99"
             st, _, body = self.post_cfg(bad)
             self.assertEqual(st, 500)
             self.assertIn("生成配置失败".encode(), body)
@@ -552,7 +552,7 @@ class AdminServerTest(unittest.TestCase):
         self.assertEqual(st, 200)
         # 页面表单不带 optional 键 → 服务端继承上一份
         cfg2 = valid_cfg()
-        cfg2["mac"]["ip"] = "192.168.1.14"
+        cfg2["mac"]["ip"] = "192.0.2.14"
         st, _, _ = self.post_cfg(cfg2)
         self.assertEqual(st, 200)
         with open(server.LOCAL_CONFIG, encoding="utf-8") as f:

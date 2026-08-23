@@ -153,8 +153,8 @@ def validate_audio_url(url: str) -> str | None:
     """校验由音箱播放的 URL（migpt /play_url 链路）。
 
     拒绝：非 http/https、userinfo（凭据泄露面）、控制/空白字符、超长、
-    localhost / loopback（127.0.0.0/8、::1、0.0.0.0）/ link-local
-    （169.254.0.0/16、fe80::，含云 metadata 169.254.169.254）/ 未指定。
+    localhost / loopback（127.0.0.0/8、::1、0.0.0.0）/ link-local 网段
+    （含云 metadata 地址 169.254.169.254）/ 未指定。
 
     放行：公网 + 私网 LAN（192.168/16、10/8、172.16/12）——音箱播放的
     直连 relay URL（http://<Mac-IP>:4378/stream）就是私网地址，属正常链路；
