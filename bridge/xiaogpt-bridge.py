@@ -70,6 +70,73 @@ AMBIENT_LIGHT_ENTITY = cfg_devices("ambient_light") or ""
 AC_TEMP_ENTITY = cfg_devices("ac_temperature") or ""
 AC_TURN_ON_ENTITY = cfg_devices("ac_turn_on") or ""
 
+# ---------- 扫地机器人（石头 G10S 2）确定性短路 ----------
+
+VACUUM_ENTITY = cfg_devices("vacuum_entity") or ""
+VACUUM_MODE_ENTITY = cfg_devices("vacuum_mode_entity") or ""
+
+
+def _ha_state(entity_id: str) -> dict:
+    token = _load_env("HA_TOKEN")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:8123/api/states/{entity_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _vacuum_shortcut(question: str) -> str | None:
+    """扫地机器人确定性短路：清扫模式/启停/回充直连 HA，一次完成。
+    2026-08-23 事故：模型绕不出「只扫不拖」掉进 native_device_command，
+    官方小爱按默认扫拖启动了机器人（又吵又错）。机器人指令绝不走模型、绝不走官方。
+    模式实体 cleaning_mode：vacuum=只扫 vac_and_mop=扫拖 mop=只拖。"""
+    if not VACUUM_ENTITY or not VACUUM_MODE_ENTITY:
+        return None  # 未配置设备实体（config/local.json 的 devices 段）
+    if not re.search(r"扫地机|机器人|石头", question):
+        return None  # 无机器人语境（“拖地”这种模糊词不触发）
+    if re.search(r"客厅|卧室|厨房|卫生间|厕所|书房|阳台|餐厅|饭厅|房间|次卧|主卧", question):
+        return None  # 按房间清扫：HA 未暴露房间 ID，短路启动会误清全屋，走模型如实处理
+    if re.search(r"暂停|停一下|歇一下", question):
+        _ha_service("vacuum", "pause", {"entity_id": VACUUM_ENTITY})
+        print("[bridge] 扫地机短路: 暂停", flush=True)
+        return "已经让它暂停了，先生。"
+    if re.search(r"停止|别扫了|别拖了|停下|取消", question):
+        _ha_service("vacuum", "stop", {"entity_id": VACUUM_ENTITY})
+        print("[bridge] 扫地机短路: 停止", flush=True)
+        return "已经让它停下了，先生。"
+    if re.search(r"回充|回基站|回家|充电|归位", question):
+        _ha_service("vacuum", "return_to_base", {"entity_id": VACUUM_ENTITY})
+        print("[bridge] 扫地机短路: 回充", flush=True)
+        return "已经让它回基站了，先生。"
+    mode = None
+    what = None
+    if re.search(r"只扫|仅扫|单扫|光扫|不拖地|不拖|纯扫", question):
+        mode, what = "vacuum", "只扫不拖"
+    elif re.search(r"扫拖|边扫边拖|又扫又拖|扫和拖|扫地拖地|扫抹", question):
+        mode, what = "vac_and_mop", "扫拖一起"
+    elif re.search(r"只拖|仅拖|单拖|光拖|拖地|拖一下|拖拖|不扫地|不扫|纯拖", question):
+        mode, what = "mop", "只拖不扫"
+    if mode:
+        _ha_service("select", "select_option",
+                    {"entity_id": VACUUM_MODE_ENTITY, "option": mode})
+        _ha_service("vacuum", "start", {"entity_id": VACUUM_ENTITY})
+        print(f"[bridge] 扫地机短路: 模式{mode} 启动", flush=True)
+        return f"开始{what}了，先生。"
+    if re.search(r"扫地|打扫|清扫|大扫除|扫一下|扫扫|干活", question):
+        # 没指明模式：按当前模式直接启动，并如实播报
+        try:
+            st = _ha_state(VACUUM_MODE_ENTITY)
+            cur = st.get("state", "unknown")
+            cur_cn = {"vacuum": "只扫", "vac_and_mop": "扫拖",
+                      "mop": "只拖"}.get(cur, "当前模式")
+        except Exception:
+            cur_cn = "当前模式"
+        _ha_service("vacuum", "start", {"entity_id": VACUUM_ENTITY})
+        print("[bridge] 扫地机短路: 当前模式启动", flush=True)
+        return f"开始扫地了（{cur_cn}），先生。"
+    return None  # 其余（问电量/滤网寿命等查询）走模型工具链
+
 ROUTER_INSTRUCTION = (
     "你是家庭语音管家的快速通道。\n"
     "日常问题直接回答或调用工具（开灯、调温度、查状态、简单算术、常识问答、"
@@ -110,7 +177,11 @@ ROUTER_INSTRUCTION = (
     "调温度直接用 entity_action 给它 set_value（如 24），绝不按温度±按钮（button ...temperature_up/down），"
     "绝不反复查询验证（红外空调没有状态回读，查了也没用，查一次实体 ID 就够）。"
     "「开空调」= 先 press " + AC_TURN_ON_ENTITY + "。\n"
-    "  native_device_command 工具仍然可用（走音箱原生日志通道），"
+    "  扫地机器人的铁律（2026-08-23 事故教训）：模式/启动/暂停/停止/回充等指令由桥侧确定性短路"
+     "直接执行，你不需要用工具操作 vacuum.* 或 cleaning_mode 相关实体；"
+     "【绝对禁止】用 native_device_command 转发扫地机器人指令（官方小爱会按默认扫拖乱来）。"
+     "只有查询类问题（电量/滤网寿命/清扫记录）才用工具读实体。\n"
+     "  native_device_command 工具仍然可用（走音箱原生日志通道），"
     "但首选 HA 的 entity_action（本地直连、状态可回读验证）。\n"
     "· 音量指令（声音调到50%/音量25%/大点声/小声点/音箱音量…）："
     "直接用 set_speaker_volume 工具执行，percent 从用户话里提取；"
@@ -1651,6 +1722,9 @@ def answer_question(question: str) -> str:
     ac_short = _ac_temp_shortcut(question)
     if ac_short:
         return ac_short
+    vac_short = _vacuum_shortcut(question)
+    if vac_short:
+        return vac_short
     if route == "native":
         return "（已交给官方小爱处理）"
     if route == "deep":
@@ -2488,6 +2562,11 @@ def answer_stream(question: str):
     ac_short = _ac_temp_shortcut(question)
     if ac_short:
         yield ac_short
+        yield "<<dialogue:end>>"
+        return
+    vac_short = _vacuum_shortcut(question)
+    if vac_short:
+        yield vac_short
         yield "<<dialogue:end>>"
         return
     if route == "native":

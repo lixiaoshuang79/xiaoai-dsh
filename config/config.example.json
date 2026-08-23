@@ -30,7 +30,9 @@
     "speaker_volume": "media_player.your_speaker_entity",
     "speaker_volume_2": "",
     "ac_temperature": "number.your_ac_temperature_entity",
-    "ac_turn_on": "button.your_ac_turn_on_entity"
+    "ac_turn_on": "button.your_ac_turn_on_entity",
+    "vacuum_entity": "vacuum.your_vacuum_entity",
+    "vacuum_mode_entity": "select.your_vacuum_cleaning_mode_entity"
   },
   "paths": {
     "node": "/usr/local/bin/node",
