@@ -87,16 +87,36 @@ class TestPendingUnified(TopicStateTestCase):
         self.assertIsNotNone(d)
         self.assertEqual(d["question"], "q")
 
-    def test_end_clears(self):
+    def test_end_writes_topic_kind(self):
+        # 2026-08-24 连续对话：每次回答后都写（end 也写，kind=topic，供承接短句）
         topic_state.record_pending("q", "A还是B？", "keep_open")
         topic_state.record_pending("q2", "好的", "end")
+        d = self._rd()
+        self.assertIsNotNone(d)
+        self.assertEqual(d["question"], "q2")
+        self.assertEqual(d["kind"], "topic")
+
+    def test_answer_word_consumes_reply_context(self):
+        topic_state.record_pending("q", "A还是B？", "keep_open")
+        ctx = topic_state.consume_pending("可以啊")
+        self.assertIn("接上一轮反问", ctx)
+        self.assertIn("可以啊", ctx)
         self.assertIsNone(self._rd())
 
-    def test_consume_pending_returns_context_and_clears(self):
-        topic_state.record_pending("q", "A还是B？", "keep_open")
-        ctx = topic_state.consume_pending("A")
-        self.assertIn("接上一轮反问", ctx)
-        self.assertIn("A", ctx)
+    def test_followup_short_keeps_pending(self):
+        topic_state.record_pending("明天天气怎么样", "先生，明天有雨。", "end")
+        ctx = topic_state.consume_pending("那后天呢")
+        self.assertIn("承接上一轮对话", ctx)
+        self.assertIn("那后天呢", ctx)
+        d = self._rd()  # 保留 pending：支持连续追问
+        self.assertIsNotNone(d)
+        ctx2 = topic_state.consume_pending("那大后天呢")
+        self.assertIn("承接上一轮对话", ctx2)
+
+    def test_full_new_question_clears(self):
+        topic_state.record_pending("明天天气怎么样", "先生，明天有雨。", "end")
+        ctx = topic_state.consume_pending("现在几点了")
+        self.assertEqual(ctx, "")
         self.assertIsNone(self._rd())
 
     def test_expired_pending_cleared(self):

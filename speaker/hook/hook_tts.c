@@ -13,9 +13,10 @@
  *   - 杀 mibrain 无效（只是 entry point）；杀官方进程会诱发云端补发死循环且我们
  *     的 TTS 合成依赖官方存活。mediaplayer 是最干净的切点。
  *
- * 保护官方合法应答（EXCEPT 白名单：闹钟/音量/新闻等官方独占应答）：
- *   - 官方合法应答的 Speak 没有「试听/会员/黑胶/版权/APP」等音乐版权失败话术特征，
- *     且此时我们不在作答（/tmp/xdf_our_pending 过期）→ 放行。
+ * 保护官方合法应答（2026-08-24 官方保持在线后收紧：仅闹钟放行）：
+ *   - 官方合法应答的 Speak（闹钟响铃 is_alarm:true）→ 放行；
+ *   - 其余一切官方 Speak（音量确认/问答补发等）→ 杀 mediaplayer
+ *     （官方进程保持在线后这些 TTS 都会下发，必须全拦，本地 AI 已接管）。
  *   - 点歌场景：官方「试听版…」话术含特征词 → 杀；或我们的作答标记新鲜 → 杀。
  *
  * 直连模式（/tmp/xdf_direct_mode 存在，Mac 挂了）：全部放行。
@@ -255,7 +256,7 @@ static int is_media_name(const unsigned char *p, long n) {
  *   Speak/StartAnswer：
  *     官方版权失败话术（试听/黑胶/会员/版权/APP）→ 杀 mediaplayer；
  *     我们正在作答（pending ≤15s）→ 杀 mediaplayer（官方抢答）；
- *     其余（闹钟/音量等官方独占确认）→ 放行。
+ *     其余（闹钟 is_alarm:true 放行；音量确认等全拦——官方在线后会下发）。
  *   媒体执行指令（wangyiyun/Play/LOOP_MODE/SetProperty/InstructionControl/Group）：
  *     闹钟响铃（is_alarm:true）→ 放行；
  *     其余 → 杀 mediaplayer（官方点歌/新闻/歌单的播放者，我们走 miplayer 零影响）。
@@ -283,7 +284,16 @@ static void check_write(const unsigned char *p, long n) {
             kill_mediaplayer();
             return;
         }
-        log_raw("PASS ", p, n);
+        /* 2026-08-24 官方保持在线后收紧：除闹钟外官方一切主动语音都拦。
+           此前官方每轮语音被 native-block 杀，PASS 放行（音量确认等官方
+           独占应答）漏不出来；官方在线后这些 TTS 都会下发，必须全拦
+           （本地 AI 已接管所有应答，官方不发声）。闹钟是官方独占保留。 */
+        if (has_marker(p, n, "is_alarm\":true")) {
+            log_raw("ALARM-PASS ", p, n);
+            return;
+        }
+        log_raw("PEND-KILL ", p, n);
+        kill_mediaplayer();
         return;
     }
     if (is_media_name(p, n)) {

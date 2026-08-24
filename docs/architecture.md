@@ -19,9 +19,10 @@ xiaoai-dsh 把小米 AI 音箱改造成「本地大模型语音管家」：音�
 │                  │                                                                           │
 │     ┌────────────┼──────────────────────────────┐                                            │
 │     ▼            ▼                              ▼                                            │
-│  native-block.sh（每轮语音立即 restart-aivs.sh   │  open-xiaoai client                       │
-│  杀掉官方进程 → 官方 TTS/媒体/执行指令全部进不来， │  （音箱端 client，连 Mac 4399 WS）        │
-│  官方永远不发声、不执行）                        │                                            │
+│  native-block.sh（官方进程保持在线（连续对    │  open-xiaoai client                       │
+│  话需要会话态），官方发声/执行由 hook 链零竞态     │  （音箱端 client，连 Mac 4399 WS）        │
+│  拦截：TTS→hook_tts 杀 mediaplayer、设备→         │                                            │
+│  hook_final 自杀、媒体→停播放器）                 │                                            │
 │     │            kill_official_leftovers 停官方 │                                            │
 │     │            TTS（mibrain_service）与媒体    │                                            │
 │     │            播放（mediaplayer/quickplayer） │                                            │
@@ -64,12 +65,13 @@ xiaoai-dsh 把小米 AI 音箱改造成「本地大模型语音管家」：音�
 
 ```
 用户说话 → 音箱唤醒 → 官方 ASR 识别 → instruction.log 落盘
-  → native-block.sh 立即杀官方进程（restart_aivs 保 hook 重启）+ 掐官方残留
+  → native-block.sh 记录 blocked-pass（官方进程保持在线，不杀；hook 链拦官方发声/执行）
   → open-xiaoai client 把文本发给 migpt（4399 WS）
   → migpt 探测桥健康（8322/v1/models）→ 调桥
   → 桥 classify_intent 分类意图 → 按路由分发（flash / flash_tools / deep / doubao / native）
   → 快通道：流式回答（垫场词 → 工具调用 → 结论）→ migpt 逐段播报
-  → 桥下发 <<dialogue:keep_open|end>> 标记 → migpt 决定是否静默唤醒保持麦克风
+  → migpt 播报完自动静默唤醒（连续对话：用户免唤醒词直接接话/打断；event_notify
+    src:1 在官方在线会话态有效）；桥 <<dialogue:keep_open|end>> 标记保留对话语义
   → 音箱 TTS 播报
 ```
 

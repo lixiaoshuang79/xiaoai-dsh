@@ -12,6 +12,9 @@ if [ -f /data/open-xiaoai/silent.wav ]; then
     esac
   done
 fi
+# 1.5 固件连续对话开关（免唤醒词续聊的前提之一：官方唤醒后保持会话/听音窗口；
+#     配合官方进程保持在线 + AI 播报完静默唤醒，用户可直接接话/打断）
+echo on > /data/mipns/dialog_continuous 2>/dev/null
 # 2. TTS 音色固定为男声（青葱 XiaoMi_M88，可按需改）
 ubus call mibrain tts_vendor_switch '{"vendor_name":"XiaoMi_M88","language_name":"cmn-Hans-CN","switch_src":"manual","dialog_id":"","tone_type":0}' > /dev/null 2>&1
 # 3. 原生执行拦截：设备指令在原生执行前被拦下，全权交给本地 AI（HA 通道执行）；

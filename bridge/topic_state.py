@@ -204,22 +204,19 @@ def update_topic(topics: list, topic_id: str, question: str, answer: str,
 
 
 def record_pending(question: str, answer: str, action: str) -> None:
-    """按对话状态记录待答复：action == keep_open 才写；end 则清理。
+    """记录上一轮对话上下文：每次回答后都写（TTL 内供下一轮消费，连续对话用）。
 
-    question: 本轮用户问题；answer: 播报全文（反问的上下文）；action: 对话状态。
+    question: 本轮用户问题；answer: 播报全文；action: 对话状态。
+    kind=reply：反问结尾（keep_open），用户可直接回答「可以啊」时理解选择；
+    kind=topic：普通回答，供「那后天呢」式承接短句补全话题。
     """
     with state_lock:
-        if action != "keep_open":
-            try:
-                os.remove(PENDING_FILE)
-            except OSError:
-                pass
-            return
         try:
             atomic_write_json(PENDING_FILE, {
                 "ts": _now_iso(),
                 "question": question,
                 "reply": answer[:800],
+                "kind": "reply" if action == "keep_open" else "topic",
             })
         except OSError:
             pass
@@ -234,9 +231,45 @@ def clear_pending() -> None:
             pass
 
 
+# 应答词：对上一轮反问的直接回答（短词，不进承接判断）
+_ANSWER_WORDS = ("可以", "可以啊", "好的", "好呀", "好啊", "好吧", "好", "行", "行啊",
+                 "不用", "不需要", "不用了", "嗯", "在", "在的", "在呢", "要", "要啊",
+                 "知道了", "哦", "哦哦", "对", "对的", "是的", "是", "算了吧", "算了")
+# 承接特征词：短句追问省略了话题（如「那后天呢」「然后呢」「下大后天呢」）
+_FOLLOWUP_WORDS = ("那", "然后", "再", "下", "明天", "后天", "昨天", "今天", "明后天",
+                   "大后天", "它", "他", "这", "哪个", "哪")
+# 强领域词：含这些词的短句视为完整问题（自带话题），不承接
+_DOMAIN_WORDS = ("天气", "温度", "气温", "几点", "多少", "股票", "基金", "新闻", "音乐",
+                 "歌", "闹钟", "灯", "空调", "风扇", "扫地", "播放", "暂停", "音量", "几度",
+                 "湿度", "雨", "价钱", "价格", "快递", "上班", "回家", "红包", "转账")
+
+
+def is_answer_word(text: str) -> bool:
+    t = text.strip().rstrip("？?。.!！～~ ")
+    if not t:
+        return False
+    if t in _ANSWER_WORDS:
+        return True
+    return len(t) <= 2 and t[0] in "好行要不要可" and t.endswith(("啊", "吧", "呀"))
+
+
+def is_followup_short(text: str) -> bool:
+    """承接短句判定：短（≤10 字）、无强领域词、含承接特征词。"""
+    t = text.strip().rstrip("？?。.!！～~ ")
+    if not t or len(t) > 10:
+        return False
+    if any(w in t for w in _DOMAIN_WORDS):
+        return False
+    return any(w in t for w in _FOLLOWUP_WORDS)
+
+
 def consume_pending(now_question: str) -> str:
-    """取走待答复状态：未过期则返回上下文文本（用于注入提示词），并清除。
-    加锁防并发：后台深任务可能同时读写 pending。"""
+    """消费上一轮上下文（注入提示词用，加锁防并发）：
+
+    - 应答词（可以啊/好/不用）→ 反问回答语义（消费并清除）；
+    - 承接短句（那后天呢/然后呢）→ 话题承接语义（保留，支持连续追问）；
+    - 完整新问题 → 上一轮上下文作废（清除），正常处理。
+    """
     with state_lock:
         try:
             with open(PENDING_FILE, encoding="utf-8") as f:
@@ -248,14 +281,27 @@ def consume_pending(now_question: str) -> str:
                 except OSError:
                     pass
                 return ""
-            ctx = (f"【接上一轮反问】上一轮用户问「{data.get('question', '')}」，"
-                   f"你当时反问：{data.get('reply', '')}\n"
-                   f"现在用户回答：「{now_question}」——请对照你的反问理解用户的选择，"
-                   f"直接执行或回答，不要再问一遍。")
+            if is_answer_word(now_question):
+                ctx = (f"【接上一轮反问】上一轮用户问「{data.get('question', '')}」，"
+                       f"你当时反问：{data.get('reply', '')}\n"
+                       f"现在用户回答：「{now_question}」——请对照你的反问理解用户的选择，"
+                       f"直接执行或回答，不要再问一遍。")
+                try:
+                    os.remove(PENDING_FILE)
+                except OSError:
+                    pass
+                return ctx
+            if is_followup_short(now_question):
+                # 承接短句：注入上下文并保留 pending（支持「那后天呢→那大后天呢」连续追问）
+                return (f"【承接上一轮对话】上一轮用户问「{data.get('question', '')}」，"
+                        f"你回答：「{data.get('reply', '')}」。\n"
+                        f"现在用户又说「{now_question}」——这是对同一话题的承接连问"
+                        f"（短句省略了话题，例如上轮在聊天气、本轮「那后天呢」就是在问"
+                        f"后天的天气）。请把它当作对上一话题的追问直接回答，不要反问。")
             try:
-                os.remove(PENDING_FILE)
+                os.remove(PENDING_FILE)  # 完整新问题：旧上下文作废
             except OSError:
                 pass
-            return ctx
+            return ""
         except (OSError, ValueError, KeyError):
             return ""

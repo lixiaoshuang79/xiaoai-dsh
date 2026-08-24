@@ -1,9 +1,12 @@
 #!/bin/sh
 # shellcheck shell=sh
 # 音箱自主大脑（正常模式=Mac 在线）：
-#   每轮语音 RecognizeResult 落盘后立即杀官方进程（官方永远不发声、不执行、不放歌），
+#   官方进程保持在线（不杀），唤醒后会话/听音窗口完整 → 用户免唤醒词接话/打断
+#   （连续对话，2026-08-24 真机验证打通）；
+#   官方一切发声/执行由 hook 链零竞态拦截（TTS→hook_tts 杀 mediaplayer、
+#   设备→hook_final 自杀、媒体→kill_official_execution 停播放器）；
 #   问答/设备/媒体全部由本地 AI（Mac 上的桥）接管；
-#   官方重连后云端补发的响应由执行指令兜底（kill_official_execution）掐执行部件。
+#   官方设备词自杀重连后云端补发的响应由执行指令兜底（kill_official_execution）掐执行部件。
 # 直连模式（Mac 挂了，direct-mode.sh 置 /tmp/xdf_direct_mode）：
 #   官方放行设备/媒体，问答拦截官方抢答 + 直连大模型 + 本地 TTS 播报。
 #
@@ -231,16 +234,19 @@ while :; do
       continue
     fi
 
-    # ---- 正常模式：官方全禁 ----
-    # 每轮语音拿到 RecognizeResult 后立即杀官方进程（restart_aivs 保 hook 自动重启）：
-    # 云端下发的官方 TTS/新闻电台/媒体/执行指令全部进不来——官方永远不发声、不执行。
-    # ASR 结果在杀之前已写入 instruction.log，migpt/本地 AI 链路不受影响；
-    # 官方重启后自动重连云端，下一轮语音识别照常（用户说话间隔远大于重连时间）。
-    # 孙燕姿事故补强：官方 TTS 由 v3 钩子拦截、媒体链由 quickplayer/mediaplayer
-    # 独立进程执行，官方响应快时可能已抢先下发——同步掐掉残留。
-    restart_aivs
+    # ---- 正常模式：官方执行全禁（2026-08-24 连续对话修复版） ----
+    # 不再每轮 restart_aivs 杀官方：官方被杀后永远处于重启-重连状态，「唤醒后
+    # 会话/播报后听音窗口」从不建立，用户免唤醒词接话/打断全部失效
+    # （event_notify 静默/有声唤醒与 oneshot 在空闲态均无效，真机三连实验证实）。
+    # 改为官方进程保持在线，官方永远不发声不执行，但会话状态完整：
+    #   · 官方 TTS：hook_tts 拦（Speak 写指令瞬间杀 mediaplayer，闹钟除外）
+    #   · 官方媒体：hook_tts 拦 + 上方 kill_official_execution 兜底
+    #   · 官方设备指令：hook_final 词表零竞态使官方进程自杀；漏网 Execute 由
+    #     上方执行指令兜底 restart_aivs（设备词场景牺牲会话，可接受）
+    #   · 唤醒后官方保持会话 → AI 播报完官方听音窗口恢复 → 免唤醒词接话/打断。
+    # 孙燕姿事故补强保留：官方响应快时可能已抢先下发播放——同步掐残留。
     kill_official_leftovers
-    log "blocked-all: $text"
+    log "blocked-pass: $text"
     continue
   done
   log "tail-exited: 守护自动重启"

@@ -175,6 +175,19 @@ pnpm build    # 编译 Rust neon 插件 → migpt/open-xiaoai.node
 pnpm start    # 4399 WS / 4398 HTTP / 4397 healthz
 ```
 
+> **连续对话（免唤醒词续聊）**：AI 播报完音箱自动开麦，用户直接接话/打断（实测
+> 「问天气 → 那后天呢 → 那大后天呢」逐轮承接）。三要素缺一不可：
+>
+> 1. **官方进程保持在线**（`speaker/native-block.sh` 已内置：普通问答不杀官方，
+>    官方发声/执行由 hook 链拦截——这是听音窗口存在的前提）；
+> 2. **固件连续对话开关**（`speaker/init.sh` 已内置：开机写
+>    `/data/mipns/dialog_continuous=on`）；
+> 3. **migpt 播报完主动静默唤醒**：在 open-xiaoai 的 `examples/migpt/config.ts`
+>    流式回答结束处（`endAnswer()` 之后）调用 `await sleep(500); await enqueueWakeUp(epoch);`
+>    替换原来「仅 `keep_open` 标记才唤醒」的分支——每次播报完都唤醒，静默无提示音，
+>    用户不开口则官方听音窗口到期自动退出。桥侧 `record_pending/consume_pending`
+>    已支持「那后天呢」式承接短句自动补全话题（topic_state 模块）。
+
 ### 4.6 深通道（可选但推荐）
 
 深通道 = 音箱的 DSH（DeepSeek Harness）headless 会话，负责复杂任务、工具调用、长期记忆。三个相关配置项：
