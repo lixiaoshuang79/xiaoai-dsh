@@ -234,6 +234,9 @@ _ROUTER_BASE = (
     "「放每日推荐/放我喜欢的歌」调 netease_music_personal；「放我的XX歌单」调 netease_music_playlist。"
     "白噪音/助眠音/电台调 web_audio_play。"
     "绝不允许自己编答案，更不允许说「我放不了/去手机听」这种回绝话术。\n"
+    "点歌播报铁律：口播的歌名/歌手必须与工具返回的「已找到：X」完全一致，"
+    "绝对禁止自己编歌名（如工具返回《我不难过》却说「给您换一首《开始懂了》」）。"
+    "换歌时若工具返回的还是同一首歌，如实说「就这一首可播，先给您放上」。\n"
     "铁律——绝不反问：所有指令类问题（调音量、调温度、开关设备、设提醒等）"
     "有明确动作就直接执行；哪怕有一点歧义，也选最合理的默认值执行，"
     "执行结果里带一句简短确认即可。只有信息严重缺失到无法执行时才反问，"
@@ -1148,6 +1151,8 @@ def weather_forecast() -> str:
 WEB_AUDIO_PLAY = os.path.join(_BRIDGE_DIR, "web-audio-play.py")
 MIGPT_PLAY_URL_BASE = "http://127.0.0.1:4398"
 _last_music_url = ""  # 最近一次播放的音频 URL（继续播放用）
+_last_play_qnorm = ""  # 最近一次点歌的问题指纹（重复点歌时重推播放用）
+_last_play_title = ""  # 最近一次点歌的歌名（重复点歌复答文案/换歌跳过用）
 _pending_play = None  # (url, title)：工具找到的音频，等 AI 回答播报完后再播放
 
 def _queue_play(url: str, title: str) -> str | None:
@@ -1159,9 +1164,11 @@ def _queue_play(url: str, title: str) -> str | None:
     _pending_play = (url, title)
     return None
 
-def _flush_pending_play() -> None:
-    """把待播放音频推给音箱（在 AI 回答播报完成之后调用，避免音乐被 TTS 打断）。"""
-    global _pending_play, _last_music_url
+def _flush_pending_play(question: str = "") -> None:
+    """把待播放音频推给音箱（在 AI 回答播报完成之后调用，避免音乐被 TTS 打断）。
+    question 非空时记录点歌状态（_last_play_qnorm/_last_play_title），
+    供重复点歌复答重推播放、换歌跳过正在播的歌使用。"""
+    global _pending_play, _last_music_url, _last_play_qnorm, _last_play_title
     if not _pending_play:
         return
     url, title = _pending_play
@@ -1171,6 +1178,9 @@ def _flush_pending_play() -> None:
         print(f"[bridge] 播放推送被拒绝(URL 校验失败): {title[:40]}", flush=True)
         return
     _last_music_url = url
+    if question:
+        _last_play_qnorm = _normalize_question(question)
+        _last_play_title = title
     try:
         payload = json.dumps({"url": url}).encode("utf-8")
         req = urllib.request.Request(
@@ -1257,12 +1267,17 @@ def _netease_get_url(song_id: int) -> str:
     _netease_url_cache[song_id] = (now, url)
     return url
 
-def _netease_pick_song(songs: list, query: str) -> dict | None:
+def _netease_pick_song(songs: list, query: str, skip: str = "") -> dict | None:
     """从搜索结果挑可播的版本：排除试听（fee>=8）；query 带歌手名时严格匹配歌手
-    （翻唱者匹配不到 → 返回 None 降级其他平台找原唱），只有歌名时取第一个可播版。"""
+    （翻唱者匹配不到 → 返回 None 降级其他平台找原唱），只有歌名时取第一个可播版。
+    skip 非空 = 换歌场景：跳过同名歌取下一首（否则「换一首」永远重放旧歌）。"""
     candidates = [s for s in songs if (s.get("fee") or 0) < 8]
     if not candidates:
         return None
+    if skip:
+        fresh = [s for s in candidates if str(s.get("name") or "") != skip]
+        if fresh:
+            candidates = fresh
     tokens = [t for t in re.split(r"[\s\-/]+", query) if len(t) >= 2]
     # 歌名词 = 与候选歌名主体精确/前缀匹配的 token（去掉括号注释，防「[原唱:周杰伦]」误判）
     song_name_tokens = set()
@@ -1283,6 +1298,17 @@ def _netease_pick_song(songs: list, query: str) -> dict | None:
     # query 只含歌名（无歌手词）→ 取第一个可播版本
     return candidates[0]
 
+# 换歌语义词：命中的工具调用要跳过正在播的那首（否则缓存复用永远重放旧歌，
+# 2026-08-25「这个不行」被当成换歌却重放《我不难过》事故）
+CHANGE_SONG_RE = re.compile(
+    r"(换一首|换首歌|换一个|换一换|换首|换掉|换歌|下一首|再换|这个不行|这个不好|"
+    r"不好听|不喜欢|不要这首|不要这个|换别的|来点别的)"
+)
+# 当前轮用户原始问题：工具执行时读它判断「换歌」语义
+# （模型常把「换一首」吞掉只传歌手名进工具 query，不能只信工具参数）
+_cur_question = ""
+
+
 def netease_music_play(query: str) -> str:
     """搜索网易云歌曲并播放第一首可播版本：search → url → 登记待播放。
     网易云无版权/搜不到时自动降级 web_audio_play（B 站/浏览器）找音源——
@@ -1290,7 +1316,13 @@ def netease_music_play(query: str) -> str:
     try:
         songs = _netease_search_songs(query)
         if songs:
-            song = _netease_pick_song(songs, query)
+            # 换歌语义：跳过正在播的那首（_last_play_title 格式「歌名 - 歌手」取歌名部分）。
+            # 用「用户原话 + 工具 query」合并判定——模型常把「换一首」吞掉只传歌手名
+            change_ctx = f"{_cur_question} {query}"
+            skip = ""
+            if CHANGE_SONG_RE.search(change_ctx) and _last_play_title:
+                skip = _last_play_title.split(" - ")[0]
+            song = _netease_pick_song(songs, query, skip)
             if song:
                 url = _netease_get_url(song["id"])
                 err = _queue_play(url, f"{song.get('name', '')} - {song.get('artists', '')}")
@@ -2061,6 +2093,55 @@ def next_filler() -> str:
     _filler_idx += 1
     return filler
 
+# ---- 低打扰进度反馈（progress ack，2026-08-25 从现网桥移植） ----
+# 根因：慢工具（点歌 6-12s / 天气 / 文件）执行期间无任何播报，用户听到垫场词后
+# 干等 7-8 秒静默，误以为失败反复重喊。
+# 方案：工具整体提交到后台 Future 立即执行；主生成器
+# future.result(timeout=ACK_DELAY)——1.6s 内完成→不播 ack；
+# TimeoutError→工具确实慢→在当前 SSE 流里 yield 一条短 ack
+# （migpt 沿 reply.stream 用 enqueueChunk 播，不经回答屏障、立即排队），
+# 然后 future.result() 继续等工具。ack 与 final 同一流：天然 ack 在 final 前、
+# 不重叠不串台；同一轮只 timeout 一次→最多 1 条；异常从 future.result 传播。
+ACK_DELAY_SECONDS = 1.6          # 工具跑超过该秒数才 yield ack（快请求不播）
+# 工具类别 → ack 模板（自然语言，不暴露工具名/API/provider）
+ACK_TEMPLATES = {
+    "get_weather": ["我查一下最新预报。"],
+    "web_search": ["我找一下。", "我搜一下。"],
+    "list_computer_files": ["我找一下文件。"],
+    "read_computer_file": ["我看一下文件。"],
+    "search_computer_files": ["我找一下。"],
+    # 点歌工具实测 6-12s（网易云 CLI ≥5s 节流 + 搜索），必须给进度语，
+    # 否则用户以为失败反复重喊（2026-08-25 孙燕姿事故根因之一）
+    "netease_music_play": ["我去找这首歌，稍等。", "正在找音源，马上好。", "我搜一下这首歌。"],
+    "web_audio_play": ["我去找这首歌，稍等。", "正在找音源，马上好。"],
+}
+ACK_DEFAULT = "我想一下。"
+# 快工具（1-2s 内返回）：绝不播 ack；netease_music_play/web_audio_play 慢，
+# 绝不在本集合（否则点歌 6-12s 干等却秒回「好嘞」）
+ACK_FAST_TOOLS = {
+    "get_now_time", "set_speaker_volume", "get_speaker_volume",
+    "native_device_command", "netease_music_personal",
+    "netease_music_playlist", "netease_music_lyric",
+    "speaker_music_control", "reminder_set", "reminder_list", "reminder_cancel",
+    # 设备控制/状态查询（HA 本地直连 1-2s）：快操作不播 ack
+    "entity_action", "call_service_tool", "get_entity", "search_entities_tool",
+}
+_ack_templates_idx = 0
+
+
+def _ack_text_for(tool_names: list) -> str | None:
+    """工具类别 → ack 文案。慢工具返回模板（未知慢工具返回默认）；快工具返回 None（不播）。"""
+    for n in tool_names:
+        if n in ACK_FAST_TOOLS:
+            continue
+        templates = ACK_TEMPLATES.get(n)
+        if templates:
+            global _ack_templates_idx
+            _ack_templates_idx += 1
+            return templates[_ack_templates_idx % len(templates)]
+        return ACK_DEFAULT
+    return None
+
 def extract_and_play(text: str) -> str:
     """从深通道答案中提取【播放】URL 并交给音箱播放，返回去除该行的文本。
     找不到就原样返回。URL 必须通过 SSRF 校验，否则拒绝播放并保留文本。"""
@@ -2653,8 +2734,10 @@ def is_device_command(question: str) -> bool:
 
 def answer_stream(question: str, turn: int | None = None):
     """流式回答生成器：意图识别驱动路由 → 真流式输出，遇「深」标记转后台深通道。"""
+    global _cur_question
     start = time.time()
     question = asr_repair(question)
+    _cur_question = question  # 工具执行时读它判断换歌等语义（桥全局锁串行，安全）
     # ---- 意图识别：分类到意图体系，路由/工具/对话状态全部由意图驱动 ----
     pending_ctx = topic_state.consume_pending(question)  # 上一轮反问的上下文（一次性消费）
     intent = classify_intent(question, pending_ctx)
@@ -2729,89 +2812,125 @@ def answer_stream(question: str, turn: int | None = None):
         dup = check_duplicate(question)
     if dup:
         print(f"[bridge] 重复问题直接复答: {question[:40]}", flush=True)
+        # 点歌类重复：复答文字之外必须重推播放（只动嘴不放歌 = 2026-08-25 孙燕姿事故根因）。
+        # 上次 URL 时效 20 分钟，去重窗口 5 分钟，重推安全；
+        # migpt 播报屏障会等 dup 文字播完再放歌。
+        if _normalize_question(question) == _last_play_qnorm and _last_music_url:
+            err = _queue_play(_last_music_url, _last_play_title)
+            if err:
+                print(f"[bridge] 重复点歌重推被拒绝: {err}", flush=True)
+            else:
+                print(f"[bridge] 重复点歌重推播放: {_last_play_title[:40]}", flush=True)
         yield dup
+        if _pending_play:
+            _flush_pending_play(question)
+            # 点歌复答轮：migpt 播完放歌且不开麦（用户跟着唱才不会被误伤打断）
+            yield "<<dialogue:end:music>>"
         return
     tools = get_openai_tools()
     prompt = build_fast_prompt(question, pending_ctx)
     messages = [{"role": "user", "content": prompt}]
     yield next_filler()  # 垫场：意图分类后立即出声（native/深路由上面已返回，不会到这里）
     progress_pushed = False  # 工具找到音乐后只垫一句进度语
-    for round_idx in range(MAX_TOOL_TURNS):
-        full_text = ""          # 本轮完整文本
-        tool_calls = []
-        # 每轮都先缓冲到轮末再决定放行内容：
-        # 「深」路由/过程叙述 = 吞掉；最终回答轮 = 整段放行。
-        # 垫场词「好的。」已给用户即时反馈，整轮缓冲的 1-3 秒延迟可接受。
-        try:
-            for kind, val in stream_llm(messages, tools):
-                if kind == "delta":
-                    full_text += val
-                else:
-                    tool_calls = val
-        except Exception as e:
-            print(f"[bridge] 流式异常({type(e).__name__}): {question[:40]}", flush=True)
-            # 大模型工具流挂了 → 大模型纯问答兜底（同样的模型，无工具）
+    try:
+        for round_idx in range(MAX_TOOL_TURNS):
+            full_text = ""          # 本轮完整文本
+            tool_calls = []
+            # 每轮都先缓冲到轮末再决定放行内容：
+            # 「深」路由/过程叙述 = 吞掉；最终回答轮 = 整段放行。
+            # 垫场词「好的。」已给用户即时反馈，整轮缓冲的 1-3 秒延迟可接受。
             try:
-                yield ask_llm_plain(question, "")
-            except Exception:
-                yield "抱歉，我的大脑卡了一下，请再说一次。"
-            return
-        if not tool_calls:
-            # 只要模型回「深」——单字，或前面有叙述最后一行单独回「深」——
-            # 都升级深通道，绝不把「深」或过程叙述念给用户
-            marker = full_text.strip().rstrip("。！？!? ，,～~").strip()
-            last_line = marker.splitlines()[-1].strip() if marker else ""
-            deep_asked = (marker == "深" or last_line == "深"
-                          or (marker.endswith("深") and len(marker) <= 6
-                              and not re.search(r"[A-Za-z]", marker[:4]))
-                          or re.search(r"[：:，,。；;]\s*深$", marker))
-            if deep_asked:
-                print(f"[bridge] 后台深化启动: {question[:40]}", flush=True)
-                _spawn_deep(question, pending_ctx, turn)
-                yield "这个问题让我好好想想，想好了再告诉我。"
+                for kind, val in stream_llm(messages, tools):
+                    if kind == "delta":
+                        full_text += val
+                    else:
+                        tool_calls = val
+            except Exception as e:
+                print(f"[bridge] 流式异常({type(e).__name__}): {question[:40]}", flush=True)
+                # 大模型工具流挂了 → 大模型纯问答兜底（同样的模型，无工具）
+                try:
+                    yield ask_llm_plain(question, "")
+                except Exception:
+                    yield "抱歉，我的大脑卡了一下，请再说一次。"
                 return
-            if full_text:
-                # 工具轮后的回答容易混入「自问自答/思考」叙述（模型偶尔抽风），
-                # 检测到元叙述特征就交给 Flash 润成纯结论；无特征直接放行
-                if round_idx > 0 and re.search(r"[，。]?让我确认|按照指令|我应该|不过|家中确|\n", full_text):
-                    try:
-                        full_text = polish_for_speech(full_text)
-                    except Exception:
-                        pass
-                full_text = strip_bbcode(full_text)
-                yield full_text  # 最终回答：整段放行
-                # 对话控制标记：意图驱动——
-                # ① 用户 farewell/stop 类意图 → 强制 end（告别了就绝不再保持麦克风）；
-                # ② 其余场景由输出侧意图识别（intent_check_dialogue）判断播报是否反问/邀请。
-                if intent.get("domain") == "chitchat" and intent.get("intent") == "farewell":
-                    dlg_action = "end"
-                elif intent.get("domain") == "dialogue_mgmt" and intent.get("intent") in ("stop_interrupt", "cancel", "deny"):
-                    dlg_action = "end"
-                else:
-                    dlg_action = intent_check_dialogue(full_text)
-                yield f"<<dialogue:{dlg_action}>>"
-                topic_state.record_pending(question, full_text, dlg_action)  # keep_open 才写，end 清理
-                remember_answer(question, full_text)  # 重复问题去重
-                _flush_pending_play()  # 回答播报完成后放音乐（工具已找到的音频）
-            print(f"[bridge] 流式 {time.time()-start:.0f}s: {question[:40]}", flush=True)
-            return
-        # 工具轮：并行执行后继续下一轮
-        messages.append({
-            "role": "assistant",
-            "content": full_text or None,
-            "tool_calls": tool_calls,
-        })
-        for tc, result_text in run_tools_parallel(tool_calls):
+            if not tool_calls:
+                # 只要模型回「深」——单字，或前面有叙述最后一行单独回「深」——
+                # 都升级深通道，绝不把「深」或过程叙述念给用户
+                marker = full_text.strip().rstrip("。！？!? ，,～~").strip()
+                last_line = marker.splitlines()[-1].strip() if marker else ""
+                deep_asked = (marker == "深" or last_line == "深"
+                              or (marker.endswith("深") and len(marker) <= 6
+                                  and not re.search(r"[A-Za-z]", marker[:4]))
+                              or re.search(r"[：:，,。；;]\s*深$", marker))
+                if deep_asked:
+                    print(f"[bridge] 后台深化启动: {question[:40]}", flush=True)
+                    _spawn_deep(question, pending_ctx, turn)
+                    yield "这个问题让我好好想想，想好了再告诉我。"
+                    return
+                if full_text:
+                    # 工具轮后的回答容易混入「自问自答/思考」叙述（模型偶尔抽风），
+                    # 检测到元叙述特征就交给 Flash 润成纯结论；无特征直接放行
+                    if round_idx > 0 and re.search(r"[，。]?让我确认|按照指令|我应该|不过|家中确|\n", full_text):
+                        try:
+                            full_text = polish_for_speech(full_text)
+                        except Exception:
+                            pass
+                    full_text = strip_bbcode(full_text)
+                    yield full_text  # 最终回答：整段放行
+                    # 对话控制标记：意图驱动——
+                    # ① 用户 farewell/stop 类意图 → 强制 end（告别了就绝不再保持麦克风）；
+                    # ② 其余场景由输出侧意图识别（intent_check_dialogue）判断播报是否反问/邀请。
+                    if intent.get("domain") == "chitchat" and intent.get("intent") == "farewell":
+                        dlg_action = "end"
+                    elif intent.get("domain") == "dialogue_mgmt" and intent.get("intent") in ("stop_interrupt", "cancel", "deny"):
+                        dlg_action = "end"
+                    else:
+                        dlg_action = intent_check_dialogue(full_text)
+                    # 点歌轮（pending 尚未 flush）：标记 :music →
+                    # migpt 播完放新歌、不恢复旧歌、不开麦（用户跟着唱才安全）
+                    dlg_suffix = ":music" if _pending_play else ""
+                    yield f"<<dialogue:{dlg_action}{dlg_suffix}>>"
+                    topic_state.record_pending(question, full_text, dlg_action)  # keep_open 才写，end 清理
+                    remember_answer(question, full_text)  # 重复问题去重
+                    _flush_pending_play(question)  # 回答播报完成后放音乐（工具已找到的音频）
+                print(f"[bridge] 流式 {time.time()-start:.0f}s: {question[:40]}", flush=True)
+                return
+            # 工具轮：并行执行后继续下一轮
             messages.append({
-                "role": "tool",
-                "tool_call_id": tc.get("id", ""),
-                "content": result_text[:4000],
+                "role": "assistant",
+                "content": full_text or None,
+                "tool_calls": tool_calls,
             })
-        # 音乐已找到：立即垫一句进度语，覆盖下一轮模型生成回答的静音空档
-        # （点歌体验：垫场 → 找到了马上放 → 回答 → 音乐，全程有反馈）
-        if _pending_play and not progress_pushed:
-            progress_pushed = True
-            yield "找到了，马上放。"
+            # 低打扰进度反馈：工具提交后台 Future 立即执行；主生成器
+            # future.result(timeout=ACK_DELAY)——1.6s 内完成→不播 ack；
+            # 超时→工具确实慢→yield 一条短 ack，然后继续等工具。
+            # 点歌类慢工具（6-12s）因此有进度语，不再干等静默。
+            tool_names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
+            ack_text = _ack_text_for(tool_names)  # 快工具 → None（不播）
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+                _tool_future = _ex.submit(run_tools_parallel, tool_calls)
+                try:
+                    tool_results = _tool_future.result(timeout=ACK_DELAY_SECONDS)
+                except concurrent.futures.TimeoutError:
+                    # 工具确实慢：yield 一条短 ack（工具从最开始就在后台跑，yield 不延迟它）
+                    if ack_text:
+                        yield ack_text
+                    tool_results = _tool_future.result()  # 继续等工具（异常正常传播）
+            for tc, result_text in tool_results:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.get("id", ""),
+                    "content": result_text[:4000],
+                })
+            # 音乐已找到：立即垫一句进度语，覆盖下一轮模型生成回答的静音空档
+            # （点歌体验：垫场 → 找到了马上放 → 回答 → 音乐，全程有反馈）
+            if _pending_play and not progress_pushed:
+                progress_pushed = True
+                yield "找到了，马上放。"
+    finally:
+        # 流式被用户新话语打断（migpt 断 SSE）时生成器会死在任意 yield 处：
+        # 工具已找到的歌照推——不推 = 前一轮点歌永远放不出来（2026-08-25 事故根因）
+        _flush_pending_play()
     yield "抱歉，我查得有点绕，请换个说法再问一次。"
 
 class Handler(BaseHTTPRequestHandler):
