@@ -84,6 +84,39 @@ test("标记提取：多个标记（最后一个 dialogue 动作生效）", () =
   assert.equal(m.playable, "正文");
 });
 
+// ============ 2026-08-25 :music 后缀（点歌轮标记） ============
+
+test("标记提取：:music 后缀（点歌轮）——dialogue 动作照常、musicMark 置位", () => {
+  const m = extractBridgeMarkers("好嘞<<dialogue:end:music>>");
+  assert.equal(m.playable, "好嘞");
+  assert.equal(m.dialogueAction, "end");
+  assert.equal(m.musicMark, true);
+  assert.equal(m.nativePass, false);
+});
+
+test("标记提取：:music 标记跨 chunk 分裂后仍识别", () => {
+  const a = extractBridgeMarkers("<<dialogue:keep_open:mu", false);
+  assert.equal(a.keep, "<<dialogue:keep_open:mu");
+  assert.equal(a.musicMark, false);
+  const b = extractBridgeMarkers(a.keep + "sic>>", false);
+  assert.equal(b.dialogueAction, "keep_open");
+  assert.equal(b.musicMark, true);
+  assert.equal(b.playable, "");
+});
+
+test("标记提取：流结束时残缺 :music 标记按控制杂质丢弃", () => {
+  const m = extractBridgeMarkers("正文<<dialogue:end:mus", true);
+  assert.equal(m.playable, "正文");
+  assert.equal(m.dialogueAction, "");
+  assert.equal(m.musicMark, false);
+});
+
+test("标记提取：不带 :music 的普通 dialogue 标记不影响 musicMark", () => {
+  const m = extractBridgeMarkers("<<dialogue:keep_open>>", false);
+  assert.equal(m.musicMark, false);
+  assert.equal(m.dialogueAction, "keep_open");
+});
+
 // ============ P1-9 onMessage try/finally：异常路径复位 answerActive ============
 
 /** 构造 fake engine：stream.read 由调用方控制。 */
@@ -265,6 +298,52 @@ test("用户插话：cancel + 代际作废，finally 复位 answerActive", async
   } finally {
     restoreFetch();
   }
+});
+
+test("点歌轮（:music 标记）：播报后不开麦、不播标记、直接结束", async () => {
+  stubBridgeHealthy();
+  try {
+    const msg = { text: "放首歌" };
+    const reads: Array<() => { next?: string; noMore?: boolean }> = [
+      () => ({ next: "找到了，马上放。", noMore: false }),
+      () => ({ next: "<<dialogue:end:music>>", noMore: false }),
+      () => ({ next: undefined, noMore: true }),
+    ];
+    const { engine, calls } = makeFakeEngine(reads, msg);
+    initSpeakerGate(engine.speaker as never);
+    const ret = await kOpenXiaoAIConfig.onMessage(engine as never, msg as never);
+    assert.deepEqual(ret, { handled: true });
+    assert.ok(calls.play.some((c) => (c as { text?: string }).text === "找到了，马上放。"));
+    assert.ok(!calls.play.some((c) => String((c as { text?: string }).text).includes("<<dialogue")));
+    assert.equal(calls.wakeUp.length, 0); // 点歌轮不开麦
+  } finally {
+    restoreFetch();
+  }
+});
+
+test("停止词分支（2026-08-25）：闭嘴静默打断不播确认；停止播放播确认语", async () => {
+  // 「闭嘴」= 静默组：不播确认语，但走带 hook 的干净重启
+  const e1 = makeFakeEngine([], { text: "闭嘴" });
+  initSpeakerGate(e1.engine.speaker as never);
+  const r1 = await kOpenXiaoAIConfig.onMessage(e1.engine as never, { text: "闭嘴" } as never);
+  assert.deepEqual(r1, { handled: true });
+  assert.equal(e1.calls.play.length, 0); // 静默：无任何播报
+  assert.ok(e1.calls.runShell.some((c) => c.includes("restart-aivs.sh")));
+  // 「停止」= 停音乐组：给一句确认，用户知道音乐停了
+  const e2 = makeFakeEngine([], { text: "停止" });
+  initSpeakerGate(e2.engine.speaker as never);
+  const r2 = await kOpenXiaoAIConfig.onMessage(e2.engine as never, { text: "停止" } as never);
+  assert.deepEqual(r2, { handled: true });
+  assert.ok(e2.calls.play.some((c) => (c as { text?: string }).text === "好的，已为您停止。"));
+  assert.ok(e2.calls.runShell.some((c) => c.includes("restart-aivs.sh")));
+});
+
+test("停止词分支：前缀匹配（停止播放xxx 也命中），标点剥离后匹配", async () => {
+  const e = makeFakeEngine([], { text: "把歌关了！" });
+  initSpeakerGate(e.engine.speaker as never);
+  const r = await kOpenXiaoAIConfig.onMessage(e.engine as never, { text: "把歌关了！" } as never);
+  assert.deepEqual(r, { handled: true });
+  assert.ok(e.calls.play.some((c) => (c as { text?: string }).text === "好的，已为您停止。"));
 });
 
 // ============ bridge.secret 读取 ============

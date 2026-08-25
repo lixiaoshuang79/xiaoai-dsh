@@ -19,12 +19,15 @@ import {
   flushPlayQueue,
   hostAllowed,
   initSpeakerGate,
+  isMusicActive,
   isValidPlayUrl,
   isBlockedHostname,
   newDialog,
+  pauseMusicForAnswer,
   playUrlNow,
   readJsonBody,
   redactUrl,
+  resumeMusic,
   shq,
   stopMusic,
   type SpeakerBackend,
@@ -90,6 +93,28 @@ function makeMock() {
 function playTexts(calls: { play: { text?: string; url?: string; blocking?: boolean }[] }): string[] {
   return calls.play.map((c) => c.text ?? "");
 }
+
+// ============ 2026-08-25 启动探测（必须在文件第一个 initSpeakerGate 测试——探测只跑一次） ============
+
+test("启动探测：首次 initSpeakerGate 探测 miplayer 有输出 → 音乐在播 + 关连续对话；只探测一次", async () => {
+  const mock = makeMock();
+  mock.setRunShellImpl(async (cmd) => {
+    if (cmd === "/bin/pidof miplayer") return { stdout: "1234 5678", stderr: "", exit_code: 0 };
+    return { stdout: "", stderr: "", exit_code: 0 };
+  });
+  initSpeakerGate(mock.backend);
+  await sleep(30); // 探测是 fire-and-forget：等 promise 链走完
+  assert.equal(isMusicActive(), true);
+  assert.ok(mock.calls.runShell.some((c) => c === "echo off > /data/mipns/dialog_continuous"));
+  // 再注入一个新后端：探测标志已置位，不应重复探测
+  const mock2 = makeMock();
+  initSpeakerGate(mock2.backend);
+  await sleep(10);
+  assert.ok(!mock2.calls.runShell.some((c) => c.includes("pidof miplayer")));
+  // 复位模块状态：后续测试都从「无音乐在播」开始
+  await stopMusic();
+  assert.equal(isMusicActive(), false);
+});
 
 // ============ P0-1 队列可靠性 ============
 
@@ -179,6 +204,72 @@ test("P0-1 epoch 过期丢弃：newDialog 作废旧对话排队中的播报段",
   assert.ok(texts.includes("new"));
 });
 
+// ============ 2026-08-25 音乐让位（暂停→恢复；明确叫停） ============
+
+test("音乐让位：未播音乐时 pauseMusicForAnswer 返回空串、不执行任何 shell", async () => {
+  const mock = makeMock();
+  initSpeakerGate(mock.backend);
+  assert.equal(isMusicActive(), false);
+  assert.equal(await pauseMusicForAnswer(), "");
+  assert.equal(mock.calls.runShell.length, 0); // 无音乐：什么都不做
+});
+
+test("音乐让位：起播后暂停返回 URL 并杀 miplayer，resume 重播同 URL", async () => {
+  const mock = makeMock();
+  initSpeakerGate(mock.backend);
+  await playUrlNow("http://example.com/song.mp3");
+  assert.equal(isMusicActive(), true);
+  const url = await pauseMusicForAnswer();
+  assert.equal(url, "http://example.com/song.mp3");
+  assert.equal(isMusicActive(), false);
+  // 暂停走 killMiplayerCmd（ubus 停媒体 + 循环杀 miplayer）
+  assert.ok(
+    mock.calls.runShell.some(
+      (c) => c.includes("ubus call mediaplayer") && c.includes("/bin/pidof miplayer"),
+    ),
+  );
+  resumeMusic(url); // 恢复 = 重播暂停前的 URL（playUrlNow 排队任务）
+  await sleep(30);
+  assert.equal(isMusicActive(), true);
+  // 起播时关连续对话（跟唱不误伤）
+  assert.ok(
+    mock.calls.runShell.filter((c) => c === "echo off > /data/mipns/dialog_continuous").length >= 1,
+  );
+});
+
+test("明确叫停：stopMusic 清空 URL、作废音乐，之后暂停不再返回 URL；并恢复连续对话", async () => {
+  const mock = makeMock();
+  initSpeakerGate(mock.backend);
+  await playUrlNow("http://example.com/song2.mp3");
+  await stopMusic();
+  assert.equal(isMusicActive(), false);
+  assert.equal(await pauseMusicForAnswer(), ""); // URL 已清空 + 音乐已停 → 空串
+  assert.ok(mock.calls.runShell.some((c) => c === "echo on > /data/mipns/dialog_continuous"));
+});
+
+test("音乐代际：playUrlNow 排队中和起播前被 stopMusic 作废 → 不拉起 miplayer", async () => {
+  const mock = makeMock();
+  initSpeakerGate(mock.backend);
+  const block = deferred();
+  // 第一个 runShell（停媒体服务）阻塞住，期间 stopMusic 作废本首歌
+  let first = true;
+  mock.setRunShellImpl(async (cmd) => {
+    if (first && cmd.includes("player_play_operation")) {
+      first = false;
+      await block.promise;
+    }
+    return { stdout: "", stderr: "", exit_code: 0 };
+  });
+  const p = playUrlNow("http://example.com/song3.mp3");
+  await Promise.resolve(); // 让队列任务真正开始（阻塞在第一个 runShell）
+  await stopMusic(); // 作废：musicEpoch+1
+  block.resolve();
+  await p;
+  // 起播命令（miplayer -f）绝不应出现
+  assert.ok(!mock.calls.runShell.some((c) => c.includes("miplayer -f")));
+  assert.equal(isMusicActive(), false);
+});
+
 // ============ P0-2 shell 注入防护 ============
 
 test("P0-2 shq：单引号/换行/分号/$()/反引号都被安全引用", () => {
@@ -253,7 +344,8 @@ test("P0-2 playUrlNow 入口拒绝非法 URL：不播放、不执行 shell", asy
   }
   // 合法 URL 照常走链路
   await playUrlNow("http://example.com/a.mp3");
-  assert.equal(mock.calls.runShell.length, 3); // stop + kill + 起播
+  // 2026-08-25：4 次 = 停媒体 + 杀 miplayer + 起播 + echo off（起播后关连续对话）
+  assert.equal(mock.calls.runShell.length, 4);
 });
 
 // ============ P0-2 URL 校验 ============

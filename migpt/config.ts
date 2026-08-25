@@ -12,6 +12,8 @@ import {
   flushPlayQueue,
   initSpeakerGate,
   newDialog,
+  pauseMusicForAnswer,
+  resumeMusic,
   stopMusic,
 } from "./migpt/speaker-gate.js";
 
@@ -256,14 +258,37 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
       return { text: "你好，很高兴认识你！" };
     }
 
-    // 打断指令：立刻停止正在播放的回答。
+    // 打断指令：立刻停止正在播放的回答 + 音乐。
+    // 音乐让位规则（2026-08-25 用户拍板）：只有明确叫停（闭嘴/停止类词）才停音乐，
+    // 跟唱/普通说话绝不碰音乐；其他提问走「暂停→回答→自动恢复」。
     // 不用 abortXiaoAI（init.d restart 会把音箱端 hook 注入的环境冲掉），
-    // 改用带 hook 的干净重启脚本，停播并保持拦截器在线
-    if (["闭嘴", "别说了", "停下", "别念了", "安静"].includes(text)) {
+    // 改用带 hook 的干净重启脚本，停播并保持拦截器在线。
+    // 两组词：静默组（播报打断，不出声——「闭嘴」要的就是立刻安静）；
+    // 停音乐组（给一句确认，否则用户不知道音乐停没停）。
+    const silentStop = ["闭嘴", "别说了", "别念了", "安静"];
+    const musicStop = [
+      "停止", "停止播放", "停下", "别放了", "别放歌", "别唱了", "暂停",
+      "不放了", "不听了", "把歌关了", "关掉音乐", "关音乐", "音乐关了", "音乐关掉",
+    ];
+    const allStop = [...silentStop, ...musicStop];
+    const cleanText = text.trim().replace(/[，。！？!?、 ]/g, "");
+    if (allStop.includes(cleanText) || allStop.some((w) => cleanText.startsWith(w))) {
       await engine.speaker.setPlaying(false);
       flushPlayQueue(); // 清空排队中的播报（深通道推送等一律作废）
-      void stopMusic(); // 连正在播/排队中的音乐一起停（内部吞错，不会 unhandled rejection）
+      await stopMusic(); // 明确叫停：作废音乐且不再自动恢复（musicEpoch+1 作废队列 + 杀 miplayer）
+      const isMusicStop =
+        musicStop.includes(cleanText) || musicStop.some((w) => cleanText.startsWith(w));
+      if (isMusicStop) {
+        try {
+          await engine.speaker.play({ text: "好的，已为您停止。", blocking: true, timeout: 8000 });
+        } catch (err) {
+          console.error("停止确认语播放失败:", err);
+        }
+      }
       try {
+        // 2026-08-25：restart-aivs.sh 部署路径固定为 /data/open-xiaoai/
+        // （仓库提供 speaker/restart-aivs.sh，见 docs/deploy.md 部署约定），
+        // 仓库版没有配置化路径，沿用该部署路径。
         await engine.speaker.runShell(
           "/data/open-xiaoai/restart-aivs.sh /data/open-xiaoai/hook_final.so",
           { timeout: 30000 },
@@ -282,8 +307,9 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
     }
 
     // ---- 默认通路：所有文本都发桥（意图识别在桥侧统一完成） ----
-    // 用户对音箱说话 = AI 优先：若音乐（miplayer）在播，先停音乐让位
-    await stopMusic();
+    // 音乐让位（2026-08-25）：不再无条件停音乐。音乐在播时先暂停并记住 URL，
+    // 回答播报完成后自动恢复；明确停止词已在上面分支拦截。
+    const resumeUrl = await pauseMusicForAnswer();
     // 关键决策：不 abort 原生小爱。原因：
     // ① abort = init.d restart（1-2 秒原生失聪），且会把音箱端 hook 注入的环境冲掉；
     // ② 官方云端设备执行链路已被音箱端 hook 锁死，设备指令不会双执行；
@@ -310,9 +336,11 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
         console.error(`❌ 大模型直连也失败: ${(err2 as Error)?.message ?? err2}`);
         await enqueuePlay("抱歉，本地和云端的大模型都暂时连不上，请稍后再试。", fallbackEpoch);
       }
+      if (resumeUrl) resumeMusic(resumeUrl); // 兜底播报完恢复音乐（排在播报链尾）
       return { handled: true };
     }
     if (!reply.stream) {
+      if (resumeUrl) resumeMusic(resumeUrl);
       return { handled: true };
     }
     // 2. 逐段播放流式回答（与引擎默认 _response 相同，但解析桥下发的控制标记）
@@ -333,6 +361,7 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
     let pendingText = ""; // 累积缓冲：控制标记可能被流式输出劈成多块
     let dialogueAction = ""; // keep_open | end | ""（默认 end）
     let nativePass = false;
+    let musicMark = false; // 2026-08-25：本轮是点歌轮（桥带 <<dialogue:...:music>>）→ 播完放新歌、不恢复旧歌、不开麦
     try {
       while (true) {
         const { next, noMore } = reply.stream.read();
@@ -348,6 +377,7 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
           const m = extractBridgeMarkers(pendingText, false);
           if (m.dialogueAction) dialogueAction = m.dialogueAction;
           if (m.nativePass) nativePass = true;
+          if (m.musicMark) musicMark = true;
           pendingText = m.keep;
           if (m.playable) {
             console.log(`🔊 ${m.playable}`);
@@ -368,6 +398,7 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
       const m = extractBridgeMarkers(pendingText, true);
       if (m.dialogueAction) dialogueAction = m.dialogueAction;
       if (m.nativePass) nativePass = true;
+      if (m.musicMark) musicMark = true;
       if (m.playable) {
         console.log(`🔊 ${m.playable}`);
         try {
@@ -380,7 +411,19 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
       endAnswer(); // 幂等复位：异常/插话/正常结束都恢复 answerActive
     }
     if (nativePass) {
+      if (resumeUrl) resumeMusic(resumeUrl); // 原生轮不放歌：恢复被暂停的音乐
       return { handled: true }; // 放行原生：官方小爱自己应答，migpt 不播
+    }
+    if (musicMark) {
+      // 2026-08-25 点歌轮：新歌由桥 /play_url 推送（自动按抢占语义播放），
+      // 不恢复旧歌、不开麦——开着麦用户跟唱会被误识别成指令打断音乐
+      return { handled: true };
+    }
+    if (resumeUrl) {
+      // 音乐被本次问答暂停：播报完自动接着放，同理不开麦（跟唱才安全）
+      resumeMusic(resumeUrl);
+      console.log("🎵 回答播报完自动恢复音乐");
+      return { handled: true };
     }
     // 3. 对话控制：AI 意图识别（桥侧独立判断）驱动，
     //    框架只执行（keep_open → 静默唤醒保持麦克风一轮；其余 → 结束对话）。
@@ -397,12 +440,16 @@ export const kOpenXiaoAIConfig: OpenXiaoAIConfig = {
  * 桥下发控制标记（流式版提取器）：标记可能被 LLM 流式输出劈成多块——
  * 完整标记被剥离（不播报），疑似「标记前缀」的尾部留到 keep 等下一 chunk
  * 确认；atEnd=true（流结束）时残缺尾部按控制杂质丢弃（不播报）。
+ * 2026-08-25：dialogue 标记兼容 (:music)? 后缀（点歌轮：<<dialogue:end:music>>），
+ * 命中后缀置 musicMark（播完放新歌、不恢复旧歌、不开麦）。
  */
-const DIALOGUE_MARKER_RE = /<<dialogue:(keep_open|end)>>/g;
+const DIALOGUE_MARKER_RE = /<<dialogue:(keep_open|end)(:music)?>>/g;
 const NATIVE_PASSTHROUGH_MARKER = "<<native_passthrough>>";
 const BRIDGE_MARKERS = [
   "<<dialogue:keep_open>>",
   "<<dialogue:end>>",
+  "<<dialogue:keep_open:music>>",
+  "<<dialogue:end:music>>",
   "<<native_passthrough>>",
 ];
 
@@ -413,16 +460,23 @@ export type BridgeMarkers = {
   keep: string;
   dialogueAction: string;
   nativePass: boolean;
+  /** 2026-08-25：出现 <<dialogue:...:music>> 点歌标记（本轮播完放新歌） */
+  musicMark: boolean;
 };
 
 export function extractBridgeMarkers(buf: string, atEnd = false): BridgeMarkers {
   let b = buf;
   let dialogueAction = "";
   let nativePass = false;
-  b = b.replace(DIALOGUE_MARKER_RE, (_m, action: string | undefined) => {
-    dialogueAction = action ?? "";
-    return "";
-  });
+  let musicMark = false;
+  b = b.replace(
+    DIALOGUE_MARKER_RE,
+    (_m, action: string | undefined, musicSuffix: string | undefined) => {
+      dialogueAction = action ?? "";
+      if (musicSuffix) musicMark = true;
+      return "";
+    },
+  );
   if (b.includes(NATIVE_PASSTHROUGH_MARKER)) {
     nativePass = true;
     b = b.split(NATIVE_PASSTHROUGH_MARKER).join("");
@@ -438,14 +492,15 @@ export function extractBridgeMarkers(buf: string, atEnd = false): BridgeMarkers 
         keep: "",
         dialogueAction,
         nativePass,
+        musicMark,
       };
     }
     const isPartial = BRIDGE_MARKERS.some(
       (m) => m.startsWith(tail) && tail.length < m.length,
     );
     if (isPartial) {
-      return { playable: b.slice(0, lastOpen), keep: tail, dialogueAction, nativePass };
+      return { playable: b.slice(0, lastOpen), keep: tail, dialogueAction, nativePass, musicMark };
     }
   }
-  return { playable: b, keep: "", dialogueAction, nativePass };
+  return { playable: b, keep: "", dialogueAction, nativePass, musicMark };
 }

@@ -143,10 +143,10 @@ async function handlePost(req: IncomingMessage, res: ServerResponse): Promise<vo
     return;
   }
   try {
-    // 对话控制标记：桥深通道推送带 <<dialogue:keep_open|end>>，
-    // 剔除后播报；keep_open → 静默唤醒保持麦克风，其余 → 结束对话
-    const marker = text.match(/<<dialogue:(keep_open|end)>>/);
-    const cleanText = text.replace(/<<dialogue:(keep_open|end)>>/g, "").trim();
+    // 对话控制标记：桥深通道推送带 <<dialogue:keep_open|end>>（2026-08-25 起兼容
+    // (:music)? 后缀），剔除后播报；keep_open → 静默唤醒保持麦克风，其余 → 结束对话
+    const marker = text.match(/<<dialogue:(keep_open|end)(:music)?>>/);
+    const cleanText = text.replace(/<<dialogue:(keep_open|end)(:music)?>>/g, "").trim();
     const epoch = currentEpoch(); // 捕获到达时代际，过期自动丢弃
     await stopMusic(); // 深通道播报优先：音乐让位（不打断正在播的 TTS 回答，受屏障保护）
     await enqueuePlay(cleanText, epoch);

@@ -7,7 +7,8 @@
  * 2. 对话代际（epoch）：每轮新对话 +1，旧对话排队中的播报段在轮到它时发现
  *    代际已过期 → 直接丢弃（用户插话后不再冒出旧回答的尾巴）。
  * 3. 音乐链独立（musicEpoch）：音乐（miplayer 拉流）与 TTS 分链——
- *    新歌顶旧歌，但放歌不打断 TTS 播报；AI 开始说话时停音乐让位。
+ *    新歌顶旧歌，但放歌不打断 TTS 播报；AI 提问时暂停音乐让位、播报完自动恢复，
+ *    只有明确叫停（闭嘴/停止类词）才真正停（2026-08-25 音乐让位规则）。
  *
  * 队列可靠性（P0-1）：播放链上每个任务包一层 try/catch——单个任务失败
  * （play/runShell reject）只记录日志，链恢复 resolved，后续任务照常执行；
@@ -26,9 +27,32 @@ export type SpeakerBackend = {
 
 let speaker: SpeakerBackend | null = null;
 
+/** 一次性启动探测标志：只跑一次（config.ts 每轮 onMessage 都幂等调 initSpeakerGate）。 */
+let musicStateProbed = false;
+
 /** 注入音箱后端（引擎启动后调用一次；测试注入 mock）。 */
 export function initSpeakerGate(s: SpeakerBackend): void {
   speaker = s;
+  // 2026-08-25：migpt 重启后内存状态与音箱实际播放状态失同步——若 miplayer 还在拉流，
+  // 标记音乐在播（URL 未知 → 问答暂停后不自动恢复，避免与 TTS 叠声）。
+  // 只探测一次：config.ts 每轮 onMessage 都会幂等调 initSpeakerGate，探测不能跟着重复跑。
+  if (musicStateProbed) return;
+  musicStateProbed = true;
+  void s
+    .runShell("/bin/pidof miplayer")
+    .then((r) => {
+      const out = r && typeof r === "object" ? String((r as { stdout?: string }).stdout ?? "") : "";
+      if (out.trim()) {
+        musicActive = true;
+        console.log(`🎵 探测到 miplayer 仍在拉流（PID ${out.trim().split(/\s+/).join(",")}），标记音乐在播`);
+        // 与音箱实际状态对齐：音乐在播 → 连续对话关（跟唱不误伤）
+        void s.runShell("echo off > /data/mipns/dialog_continuous").catch(() => {});
+      } else {
+        // 无音乐 → 恢复官方连续对话（正常问答的免唤醒词接话体验）
+        void s.runShell("echo on > /data/mipns/dialog_continuous").catch(() => {});
+      }
+    })
+    .catch(() => {});
 }
 
 function sp(): SpeakerBackend {
@@ -114,24 +138,69 @@ export function currentEpoch(): number {
 
 // ---- 音乐链 ----
 let musicEpoch = 0;
+let lastMusicUrl = ""; // 最近一次起播的音乐 URL（问答暂停后自动恢复用）
+let musicActive = false; // 音乐是否在播（miplayer 拉流中）
 
 /**
- * AI 开始说话（新对话）时停音乐让位；也作废排队中的音乐。
+ * 停音乐公共 shell（2026-08-25 抽出）：停媒体服务当前播放项（防播完自动续下一个）+
+ * mphelper pause + 循环杀光 miplayer。
+ */
+function killMiplayerCmd(): string {
+  return (
+    "ubus call mediaplayer player_play_operation '{\"action\":\"stop\"}' 2>/dev/null; " +
+    "mphelper pause 2>/dev/null; " +
+    "for i in 1 2 3 4 5; do kill -9 $(/bin/pidof miplayer) 2>/dev/null; " +
+    "/bin/pidof miplayer >/dev/null 2>&1 || break; sleep 0.3; done; true"
+  );
+}
+
+/**
+ * 明确停止音乐（用户说「闭嘴/停止」）：作废旧音乐并清空状态，不自动恢复。
+ * 音乐让位规则（2026-08-25 用户拍板）：只有明确叫停才停；其余提问只暂停、答完恢复。
  * 内部吞错：停音乐是尽力而为（失败只记录，musicEpoch 已作废排队音乐），
  * 绝不向上抛造成 unhandled rejection。
  */
 export async function stopMusic(): Promise<void> {
   musicEpoch += 1;
+  musicActive = false;
+  lastMusicUrl = "";
   try {
-    await sp().runShell(
-      "ubus call mediaplayer player_play_operation '{\"action\":\"stop\"}' 2>/dev/null; " +
-      "mphelper pause 2>/dev/null; " +
-      "for i in 1 2 3 4 5; do kill -9 $(/bin/pidof miplayer) 2>/dev/null; " +
-      "/bin/pidof miplayer >/dev/null 2>&1 || break; sleep 0.3; done; true"
-    );
+    await sp().runShell(killMiplayerCmd());
   } catch (err) {
     console.error("🔇 停音乐失败（musicEpoch 已作废排队音乐）:", err);
   }
+  // 音乐停了：恢复官方连续对话（正常问答的免唤醒词接话体验）
+  void sp()
+    .runShell("echo on > /data/mipns/dialog_continuous")
+    .catch(() => {});
+}
+
+/**
+ * AI 问答让位：音乐在播则停掉但记住 URL，播报完成后由 resumeMusic 恢复。
+ * 无音乐在播返回空串（什么都不做）。
+ * 不等回答屏障（屏障圈住的是 TTS 播报链）：直接杀 miplayer 让位，
+ * AI 播报由流式回答屏障保护不受影响。
+ */
+export async function pauseMusicForAnswer(): Promise<string> {
+  if (!musicActive) return "";
+  musicEpoch += 1;
+  musicActive = false;
+  try {
+    await sp().runShell(killMiplayerCmd());
+  } catch (err) {
+    console.error("🔇 暂停音乐失败（musicEpoch 已作废排队音乐）:", err);
+  }
+  return lastMusicUrl;
+}
+
+/** 恢复被问答暂停的音乐（重播暂停前的 URL；新歌会按抢占语义顶掉它）。 */
+export function resumeMusic(url: string): void {
+  if (url) playUrlNow(url);
+}
+
+/** 音乐当前是否在播（点歌播报后不开麦的判断依据）。 */
+export function isMusicActive(): boolean {
+  return musicActive;
 }
 
 // ---- 播报入口 ----
@@ -168,6 +237,7 @@ export function enqueueWakeUp(epoch: number): Promise<void> {
  * 走 miplayer（音箱已验证可在线播 B 站 CDN 流）；ubus player_play_url
  * 返回 code 0 但实际不播放（不可靠，弃用）。
  * URL 在入口先过严格校验（P0-2），进 shell 前再经 shq() 单引号转义。
+ * 起播成功后记录 lastMusicUrl/musicActive 并关官方连续对话（2026-08-25）。
  */
 export function playUrlNow(url: string): Promise<void> {
   if (!isValidPlayUrl(url)) {
@@ -186,11 +256,18 @@ export function playUrlNow(url: string): Promise<void> {
       "for i in 1 2 3 4 5; do kill -9 $(pidof miplayer) 2>/dev/null; " +
       "pidof miplayer >/dev/null 2>&1 || break; sleep 0.3; done; sleep 0.3"
     );
-    if (musicEpoch !== myEpoch) return;
+    if (musicEpoch !== myEpoch) return; // 2026-08-25：起播前再查一次代际（现网语义）
     // ( cmd & ) 双括号后台：exec shell 退出后 miplayer 继续活
     await sp().runShell(
       `( miplayer -f ${shq(url)} >/dev/null 2>&1 & )`
     );
+    lastMusicUrl = url; // 记录：问答暂停后自动恢复用
+    musicActive = true;
+    // 音乐播放期间关闭官方连续对话：唤醒单轮即可——
+    // 否则用户跟唱/跟旁边人说话会被持续识别成指令（2026-08-25「停止后乱做任务」事故根因）
+    void sp()
+      .runShell("echo off > /data/mipns/dialog_continuous")
+      .catch(() => {});
   });
 }
 
